@@ -1,0 +1,822 @@
+---
+title: "Data Analysis"
+author: "Ana Kovacic"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r}
+p <- "NEG"
+software <- "progenesis" #progenesis / mzmine
+myfile <- "data/ANA_MSE_NEG_ALL_MASS_PROG.xlsx" #"data/ANA_MSE_POS_MZMINE_30ppm.xlsx" #"data/ANA_MSE_POS_ALL_MASS_PROG.xlsx"
+
+library(writexl)
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(MetaboAnnotation)
+library(effectsize)
+library(DT)
+library(kableExtra)
+library(vegan)
+library(devtools)
+#library(ggvegan)
+library(reshape2)
+
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+```
+
+
+# Data import
+
+```{r, message=FALSE}
+if(software == "progenesis"){
+  feat <- read_xlsx(myfile, skip = 2) #SKIP first two empty rows 
+  
+  tmp <- read_xlsx(myfile)
+  
+  # select raw data:
+  data_raw <- feat[, grep("Raw", colnames(tmp)):(grep("Not identified", tmp[2,])-1)]
+  
+  feat <- data.frame(feat[,c(3, 5)])
+  colnames(feat) <- c("mz", "RT")
+  
+  rm(tmp)
+} else if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data_raw <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data_raw) <- feat$FT
+data_raw <- data.frame(t(data_raw))
+```
+
+# Data organization
+
+```{r}
+smpl_class <- rep("sample", nrow(data_raw))
+smpl_class[grep("QC", rownames(data_raw))] <- "QC"
+smpl_class[grep("Blank|PPB", rownames(data_raw))] <- "blank"
+
+# number of NON-missing values in QC
+idx_QC <- grep("QC", rownames(data_raw))
+smpl_order <- as.numeric(substr(rownames(data_raw), 13, 14))
+idx_QC <- idx_QC[(smpl_order[idx_QC] >= 8) & (smpl_order[idx_QC] <= 59)] #take only qc from the last of the first and the first of the last
+data_QC <- data_raw[idx_QC, ]
+feat$QC_nonNA <- apply(data_QC, 2, function(x) sum(x > 0)) #in how many samples the feature is not zero, missing?
+
+rm(idx, idx_QC, data_QC, smpl_order) 
+
+metadata <- data.frame(
+  id = gsub(".*_AK_|_MSe.*", "", rownames(data_raw)) #id is the sample name
+) #we are using tidevrsy because the variables can be different and not only numeric like should be in dataframe
+metadata$order <- as.numeric(gsub("_.*", "", metadata$id)) # second colum order of samples
+metadata$class <- smpl_class #third colume is sample class
+
+mydat <- cbind.data.frame(metadata, data_raw) #we have bind now the metadata with raw data
+
+colnames(feat)[colnames(feat) == "FT"] <- "name"
+mydat <- mydat %>%
+  as.tibble() %>% # transform the object to a "tibble" 
+  # each row of the tibble corresponds to a compound:
+  pivot_longer(starts_with("FT"))  %>% 
+  # put all columns, except "name", in the list of the tibble called "data"
+  nest(data = !c("name")) %>% #this information will be in gather in one column - called data
+  # aggregate feature information
+  left_join(feat, by = "name") #information on id, order, class,value - raw
+rm(data_raw, feat, metadata, smpl_class) # remove the non needing things 
+
+mydat <- mydat %>%
+  mutate(data = map(data, function(t){
+    t$val_0 <- t$value
+    t$value[t$value == 0] <- NA #replace missing values with zero
+    t$log <- log10(t$value) #transform the t_value, log10 of zero return NA
+    t
+  }))
+
+#mydat <- mydat[!mydat$noise, ] #for now we decide not to exclude the noise, based on preliminary result
+```
+
+
+# Normalize
+
+```{r}
+mydat <- mydat %>% #we decide not to impute data before normalisation 
+  mutate(norm_mdl = map(data, function(t){
+    t <- t %>%
+      filter(class == "QC" & order >= 8 & order <= 59) #for normalisation we use the last of the first qc in between and the one before last one
+    if(sum(is.na(t$log)) < nrow(t)*3/4){ #if feature not missing in more than 75% samples than apply the function?
+      val <- t$log #we transform data before normalisation
+      order <- t$order
+      mdl <- lm(val ~ order) #we apply the linear normalisation on the values withing the order of injection
+      mdl
+    }
+  }))
+
+myimputer <- function(v, w){
+  set.seed(123) #change the missing values with the random value between min value of the colume/10
+  if(sum(is.na(v)) == 0){
+    return(v)
+  } else {
+    napos <- which(is.na(v))
+    newval <- runif(length(napos), 0, min(w, na.rm = TRUE)/10)
+    out <- v
+    out[napos] <- log10(newval) #tranform the new data
+    return(out)
+  }
+}
+mydat <- mydat %>% #normalise by using the individual slope exluding the missing values
+  mutate(data = map2(data, norm_mdl, function(t, u){ #map function  iterate over two arguments at a time, norm mdl to have a value and not a list
+    if(!is.null(u)){
+      p <- predict(u, newdata = data.frame(order = t$order)) #we predict the new values based on the qc normalisation
+      t$norm_indiv <- t$log - p + (u$fitted.values[1] + u$residuals[1]) #normalise predicted values by individual slope, trasformed data - predicted value times fitted values plus residuals
+      t$norm_indiv_i <- myimputer(v = t$norm_indiv, w = t$value) # impute normalise data
+      t
+    } else {
+      t
+    }
+  })) 
+```
+
+
+# Feature quality
+
+```{r}
+data <- mydat %>%
+select(c("name", "data")) %>%
+  unnest(data) %>%
+  filter(class == "sample") %>% #AGAIN BIG TABLE
+select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("id")
+mydat$mean_samples <- apply(data, 2, mean)
+
+data <- mydat %>%
+  select(c("name", "data")) %>%
+  unnest(data) %>%
+  filter(class == "blank") %>% #AGAIN BIG TABLE
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("id")
+mydat$mean_blank <- apply(data, 2, mean)
+mydat$mean_ratio <- mydat$mean_samples / mydat$mean_blank #
+
+rsd <- function(x){(sd(x) / mean(x))*100} #For mass features rsd higher in the qc than in the samples excluded them
+data <- mydat %>%
+  select(c("name", "data")) %>%
+  unnest(data) %>%
+  filter(class == "QC") %>% #AGAIN BIG TABLE
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("id")
+mydat$RSD_QC <- apply(data, 2, rsd)
+data <- mydat %>%
+  select(c("name", "data")) %>%
+  unnest(data) %>%
+  filter(class == "sample") %>% #AGAIN BIG TABLE
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("id")
+mydat$RSD_samples <- apply(data, 2, rsd)
+
+mydat$noise <- (mydat$mean_ratio < log10(5)) | (mydat$RSD_QC > mydat$RSD_samples) | 
+  (mydat$QC_nonNA < max(mydat$QC_nonNA)*0.75) #Noise if the mean ratio is bellowed 5 or rsd is higher in qc than in samples or feature is zero in sample and blank, is not present in more than 75% of QC
+
+table(mydat$noise)
+#rm(data) 
+```
+
+
+# Annotation
+#implemente the annotated compounds into the code, run the iondb
+
+## MS2 annotated features
+
+```{r}
+load("rdata/ionsdb_AnnComp.RData")
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+feat <- data.frame(mydat[,c("name", "mz", "RT")])
+pr <- MzRtParam(tolerance = 0.01, toleranceRt = 0.15) # define the parameters
+mt_ft <- matchValues(feat, ionsdb, param = pr, 
+                     rtColname = c("RT", "ion_rt"),
+                     mzColname = c("mz", "ion_mz"))
+mtft_df <- data.frame(matchedData(mt_ft))
+
+
+tmp_ft <- unique(mtft_df$name[which(duplicated(mtft_df$name))])
+if(length(tmp_ft)>0){
+  for(i in seq(length(tmp_ft))){
+  idx2 <- which(mtft_df$name == tmp_ft[i],)
+  tmp <- mtft_df[idx2,]
+  mtft_df <- mtft_df[-idx2,]
+  if(length(unique(gsub("\\ \\(.*", "", tmp$target_name))) == 1){
+    tmp <- tmp[which.min(abs(tmp$score_rt)),]
+  } else {
+    tmp$target_name <- paste(tmp$target_name, collapse = "; ")
+    tmp$target_compound_id <- tmp$target_ion_adduct <- tmp$target_ion_mz <- tmp$target_ion_rt <- tmp$target_comment <- tmp$target_activity <- tmp$target_level <- NA
+    tmp <- tmp[1,]
+  }
+  mtft_df <- rbind(mtft_df, tmp)
+}
+}
+idx <- which(colnames(mtft_df) %in% c("mz", "RT")) #we have to remove the columes with the same name
+mtft_df <- mtft_df[,-idx]
+mydat <- mydat %>%
+  left_join(mtft_df, by = "name")
+
+ft_ms2 <- mtft_df[!is.na(mtft_df$target_name),]
+write_csv(ft_ms2, paste0(p, "_AnnotatedComp_TableR.csv"))
+#ft_na <- mtft_df[is.na(mtft_df$target_name),]
+```
+
+
+# statistical analysis
+
+## PCA - All samples
+
+```{r}
+data <- mydat %>%
+  select(c("name", "data", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>% #exclude noise
+#  filter(!is.na(target_name)) %>% #in case you don't want to only with annotated mass features than uncomment or actually coppy all the pca to have both as well as for volcano plots
+  select(c("name", "data"))  %>%
+  unnest(data) %>% #AGAIN BIG TABLE
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("id")
+
+data <- apply(data, 2, scaling.pareto) #apply scaling to all colums
+
+pca <- prcomp(data, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+s_class <- mydat$data[[1]]$class
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = s_class, colors = "Set1",
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+```
+
+
+## Study samples all compounds
+
+### PCA
+
+```{r}
+mydat <- mydat %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled sampels and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+
+data <- mydat %>%
+  select(c("name", "data2", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>%
+#  filter(!is.na(target_name)) %>% 
+  select(c("name", "data2"))  %>%
+  unnest(data2) %>%
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>%
+  column_to_rownames("id")
+
+data <- apply(data, 2, scaling.pareto)
+
+pca <- prcomp(data, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+
+s_class <- gsub('[[:digit:]]+', '', rownames(data)) #exlude numbers from the names, we had to do it like that because i made some errors in sample names
+s_class <- gsub("_", "", s_class)
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC3, y = ~PC4, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC3 (", sprintf("%.1f", summary(pca)$importance[2,3]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC4 (", sprintf("%.1f", summary(pca)$importance[2,4]*100), "%)"))
+  )
+```
+
+### Vegan package
+
+```{r}
+#permanova (test that the centroids and dispersion of the groups as defined by measure space are equivalent for all groups
+
+mydat <- mydat %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled sampels and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+
+data <- mydat %>%
+  select(c("name", "data2", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>%
+#  filter(!is.na(target_name)) %>% 
+  select(c("name", "data2"))  %>%
+  unnest(data2) %>%
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>%
+  column_to_rownames("id")
+
+distance2 <- vegdist(data,method="euclidean") #we create distances
+test2<-anova(betadisper(distance2, s_class)) #nesting betadispersion with anova, two functions, 
+#are distances and disperions between these different classes equal, based on the s-class
+#in this case we use anova to check the variance using average of distances instead of average, as anova
+#if p value higher than 0.05 means that the distances between groups are equale, you can use permanova, otherwise not
+test2
+```
+### ANOVA
+
+```{r, message=FALSE}
+#prepare data frame for anova
+data_anova<-as.data.frame(t(data))
+data_anova
+
+data_anova2 <- melt(as.matrix(data_anova))[-1]
+data_anova2 <- setNames(data_anova2, c("Group","Response"))
+data_anova2$Group <- gsub('[[:digit:]]+', '', data_anova2$Group)
+    data_anova2$Group <- gsub("_", "", data_anova2$Group)
+ # visualize data
+boxplot(Response ~ Group, data = data_anova2)
+aggregate(Response ~ Group, data = data_anova2,
+  function(x) round(c(mean = mean(x), sd = sd(x)), 2))
+# perform aANOVA
+anova_one_way <- aov(Response ~ Group, data = data_anova2)
+summary(anova_one_way)
+#F>1, p-value<0.05 - the probabity of F being higher is high, higher F, bigger difference between groups
+#for our results anova test is siggesting there is a significant difference between groups
+
+#post-hoc test - to see which group(s) is(are) different from the others by comparing groups 2 by 2
+# Tukey HSD test:
+TukeyHSD(anova_one_way) #if p-value > 0.05 there is no statistically significant difference between two groups
+plot(TukeyHSD(anova_one_way))
+#if it cross the zero line, there is no statistical significant difference
+
+ rm(data_anova, data_anova2)   
+```
+
+## Study samples AnnComp
+
+### PCA
+
+```{r}
+mydat <- mydat %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled sampels and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+
+data <- mydat %>%
+  select(c("name", "data2", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>%
+  filter(!is.na(target_name)) %>% 
+  select(c("name", "data2"))  %>%
+  unnest(data2) %>%
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>%
+  column_to_rownames("id")
+
+data <- apply(data, 2, scaling.pareto)
+
+pca <- prcomp(data, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+
+s_class <- gsub('[[:digit:]]+', '', rownames(data)) #exlude numbers from the names, we had to do it like that because i made some errors in sample names
+s_class <- gsub("_", "", s_class)
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC3, y = ~PC4, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC3 (", sprintf("%.1f", summary(pca)$importance[2,3]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC4 (", sprintf("%.1f", summary(pca)$importance[2,4]*100), "%)"))
+  )
+```
+
+### Vegan package
+
+```{r}
+### permanova (test that the centroids and dispersion of the groups as defined by measure space are equivalent for all groups
+mydat <- mydat %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled sampels and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+
+data <- mydat %>%
+  select(c("name", "data2", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>%
+  filter(!is.na(target_name)) %>% 
+  select(c("name", "data2"))  %>%
+  unnest(data2) %>%
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>%
+  column_to_rownames("id")
+
+distance2 <- vegdist(data,method="euclidean") #we create distances
+test2<-anova(betadisper(distance2, s_class)) #nesting betadispersion with anova, two functions, 
+#are distances and disperions between these different classes equal, based on the s-class
+#in this case we use anova to check the variance using average of distances instead of average, as anova
+#if p value higher than 0.05 means that the distances between groups are equale, you can use permanova, otherwise not
+test2
+```
+### ANOVA 
+
+```{r, message=FALSE}
+#prepare data frame for anova
+data_anova<-as.data.frame(t(data))
+data_anova
+
+data_anova2 <- melt(as.matrix(data_anova))[-1]
+data_anova2 <- setNames(data_anova2, c("Group","Response"))
+data_anova2$Group <- gsub('[[:digit:]]+', '', data_anova2$Group)
+    data_anova2$Group <- gsub("_", "", data_anova2$Group)
+ # visualize data
+boxplot(Response ~ Group, data = data_anova2)
+aggregate(Response ~ Group, data = data_anova2,
+  function(x) round(c(mean = mean(x), sd = sd(x)), 2))
+# perform aANOVA
+anova_one_way <- aov(Response ~ Group, data = data_anova2)
+summary(anova_one_way)
+#F>1, p-value<0.05 - the probabity of F being higher is high, higher F, bigger difference between groups
+#for our results anova test is siggesting there is a significant difference between groups
+
+#post-hoc test - to see which group(s) is(are) different from the others by comparing groups 2 by 2
+# Tukey HSD test:
+TukeyHSD(anova_one_way) #if p-value > 0.05 there is no statistically significant difference between two groups
+plot(TukeyHSD(anova_one_way))
+#if it cross the zero line, there is no statistical significant difference
+
+ rm(data_anova, data_anova2)   
+```
+
+# Pairwise comparision
+
+```{r}
+mydat <- mydat %>%
+  mutate(data2 = map(data2, function(t){
+    t$class <- gsub('[[:digit:]]+', '', t$id)
+    t$class <- gsub("_", "", t$class)
+    t
+  }))
+```
+
+
+## PS vs others
+
+```{r}
+mydat <- mydat %>%
+  #  filter(noise == FALSE) %>% 
+  mutate(pval_PS = map2_dbl(data2, noise, function(t, u){ #mutate or add colume with p value for feature not noise and 9 for feature that is noise
+    if(u == FALSE){
+      t$group <- ifelse(t$class == "PS", "PS", "others") #if ps than named ps otherwise others, group colume is others and ps
+      t.test(t$norm_indiv_i ~ t$group)$p.value #perform t test using value norm_indiv_i between two groups in colume group
+    } else {
+      9
+    }
+  })) %>%
+  mutate(es_PS = map2_dbl(data2, noise, function(t, u){ #calculating the effect size in the same way
+    if(u == FALSE){
+      t$group <- ifelse(t$class == "PS", "PS", "others")
+      cohens_d(t$norm_indiv_i ~ t$group)$Cohens_d #if not noise calculate the cohens_d otherwise put zero, the higher the cohens_d the higher significance 
+    } else {
+      0
+    }
+  }))
+
+
+#selection of significant mass features
+pval_PS_min <- sort(mydat$pval_PS)[500] #get the 100th min p-value
+mydat$pval_PS_selected = mydat$pval_PS <= pval_PS_min #generate the colume where your compare the values, true if the value is lower or equale to 100 min p value
+
+es_PS_max <- sort(abs(mydat$es_PS), decreasing = TRUE)[500] #get the 100th abs highest es value
+mydat$es_PS_selected = abs(mydat$es_PS) >= es_PS_max #generate the colume where your compare the values, true if the value is higher or equale to 100 max abs es value
+
+mydat$significant_massFeature_PS = (mydat$pval_PS_selected==TRUE & mydat$es_PS_selected==TRUE)
+ checkData=mydat[mydat$significant_massFeature_PS==TRUE,]
+
+```
+
+
+### PS vs others - All
+
+```{r}
+#make volcano plots 
+idx <- which(!mydat$noise) #data that is not noise
+plot(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "PS vs others",
+     xlim = max(abs(mydat$es_PS[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & mydat$pval_PS < 0.05 & mydat$es_PS < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than  -10
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$pval_PS < 0.05 & mydat$es_PS > 1)
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name))
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#036ffc60", bg="#036ffc", pch = 23) #annoated compounds
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_PS==TRUE)
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#036ffc60", bg="#036ffc", pch = 9) #significant_massFeature
+```
+
+###  PS vs others - AnnComp
+
+```{r}
+#make volcano plots 
+idx <- which(!mydat$noise & !is.na(mydat$target_name)) #data that is not noise and is annotated
+plot(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "PS vs others",
+     xlim = max(abs(mydat$es_PS[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_PS < 0.05 & mydat$es_PS < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than  -10
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_PS < 0.05 & mydat$es_PS > 1)
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_PS == TRUE & !is.na(mydat$target_name))
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx],col = "#036ffc60", bg="#036ffc", pch = 24) #THUS THIS WORK, it should mark the mass features that were also selected as statsitically significan based on lowest p value and highest abs es value
+```
+
+
+## PF vs (D & DO)
+
+```{r}
+mydat <- mydat %>%
+  #  filter(noise == FALSE) %>%
+  mutate(pval_PF = map2_dbl(data2, noise, function(t, u){
+    if(u == FALSE){
+      t <- t %>%
+        filter(class != "PS") #exclude PS group
+      t$group <- ifelse(t$class == "PF", "PF", "others")
+      t.test(t$norm_indiv_i ~ t$group)$p.value
+    } else {
+      9
+    }
+  })) %>%
+  mutate(es_PF = map2_dbl(data2, noise, function(t, u){
+    if(u == FALSE){
+      t <- t %>%
+        filter(class != "PS")
+      t$group <- ifelse(t$class == "PF", "PF", "others")
+      cohens_d(t$norm_indiv_i ~ t$group)$Cohens_d
+    } else {
+      0
+    }
+  }))
+
+#selection of significant mass features
+pval_PF_min <- sort(mydat$pval_PF)[500] #get the 100th min p-value
+mydat$pval_PF_selected = mydat$pval_PF <= pval_PF_min #generate the colume where your compare the values, true if the value is lower or equale to 100 min p value
+
+es_PF_max <- sort(abs(mydat$es_PF), decreasing = TRUE)[500] #get the 100th abs highest es value
+mydat$es_PF_selected = abs(mydat$es_PF) >= es_PF_max #generate the colume where your compare the values, true if the value is higher or equale to 100 max abs es value
+
+mydat$significant_massFeature_PF = (mydat$pval_PF_selected==TRUE & mydat$es_PF_selected==TRUE)
+ checkData=mydat[mydat$significant_massFeature_PF==TRUE,]
+
+```
+
+
+### PF vs (D & DO) - All
+
+```{r}
+
+#make volcano plots 
+idx <- which(!mydat$noise) #data that is not noise
+plot(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "PF vs others",
+     xlim = max(abs(mydat$es_PF[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & mydat$pval_PF < 0.05 & mydat$es_PF < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than absolute -10
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$pval_PF < 0.05 & mydat$es_PF > 1)
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name))
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#036ffc60", bg="#036ffc", pch = 23) #annoated compounds
+#try to add on the graphs the name of annotated compounds
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_PF==TRUE)
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], col = "#036ffc60", bg="#036ffc", pch = 9) #significant_massFeature
+```
+
+### PF vs (D & DO) - AnnComp
+
+```{r}
+#make volcano plots 
+idx <- which(!mydat$noise & !is.na(mydat$target_name)) #data that is not noise and is annotated
+plot(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "PF vs (D & DO)",
+     xlim = max(abs(mydat$es_PF[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_PF < 0.05 & mydat$es_PF < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than  -10
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_PF < 0.05 & mydat$es_PF > 1)
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_PF == TRUE & !is.na(mydat$target_name))
+points(mydat$es_PF[idx], -log10(mydat$pval_PF)[idx],col = "#036ffc60", bg="#036ffc", pch = 24) #THUS THIS WORK, it should mark the mass features that were also selected as statsitically significan based on lowest p value and highest abs es value
+```
+
+## D vs DO
+
+```{r}
+mydat <- mydat %>%
+  #  filter(noise == FALSE) %>%
+  mutate(pval_D = map2_dbl(data2, noise, function(t, u){
+    if(u == FALSE){
+      t <- t %>%
+        filter(class != "PS|PF") #exclude PS and PF group
+      t$group <- ifelse(t$class == "D", "D", "DO")
+      t.test(t$norm_indiv_i ~ t$group)$p.value
+    } else {
+      9
+    }
+  })) %>%
+  mutate(es_D = map2_dbl(data2, noise, function(t, u){
+    if(u == FALSE){
+      t <- t %>%
+        filter(class != "PS|PF")
+      t$group <- ifelse(t$class == "D", "D", "DO")
+      cohens_d(t$norm_indiv_i ~ t$group)$Cohens_d
+    } else {
+      0
+    }
+  }))
+
+#selection of significant mass features
+pval_D_min <- sort(mydat$pval_D)[500] #get the 100th min p-value
+mydat$pval_D_selected = mydat$pval_D <= pval_D_min #generate the colume where your compare the values, true if the value is lower or equale to 100 min p value
+
+es_D_max <- sort(abs(mydat$es_D), decreasing = TRUE)[500] #get the 100th abs highest es value
+mydat$es_D_selected = abs(mydat$es_D) >= es_D_max #generate the colume where your compare the values, true if the value is higher or equale to 100 max abs es value
+
+mydat$significant_massFeature_D = (mydat$pval_D_selected==TRUE & mydat$es_D_selected==TRUE)
+ checkData=mydat[mydat$significant_massFeature_D==TRUE,]
+
+```
+ 
+### D vs DO - All
+
+```{r}
+#make volcano plots
+idx <- which(!mydat$noise) #data that is not noise
+plot(mydat$es_D[idx], -log10(mydat$pval_D)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "D vs DO",
+     xlim = max(abs(mydat$es_D[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & mydat$pval_D < 0.05 & mydat$es_D < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than absolute -10
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$pval_D < 0.05 & mydat$es_D > 1)
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name))
+points(mydat$es_PS[idx], -log10(mydat$pval_PS)[idx], col = "#036ffc60", bg="#036ffc", pch = 23) #annoated compounds
+#try to add on the graphs the name of annotated compounds
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_D==TRUE)
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx], col = "#036ffc60", bg="#036ffc", pch = 9) #significant_massFeature
+```
+
+### D vs DO - AnnComp
+
+```{r}
+#make volcano plots 
+idx <- which(!mydat$noise & !is.na(mydat$target_name)) #data that is not noise and is annotated
+plot(mydat$es_D[idx], -log10(mydat$pval_D)[idx], bty = "l", #apply -log10 on p values, bty = "l" - cosumaying the box around the plot
+     xlab = "Cohens'd", ylab = "-log10(p-value)", main = "D vs DO",
+     xlim = max(abs(mydat$es_D[idx])) * c(-1, 1)) #we centrilised the zero values
+#abline(h = -log10(0.05), col = "grey", lty = 2)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_D < 0.05 & mydat$es_D < (-1)) #define some criterias for significan mass features, my data is not noise, pvalue higher than 0.0001 and ef lower than  -10
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx], col = "#E78AC360", pch = 16)
+idx <- which(mydat$noise == FALSE & !is.na(mydat$target_name) & mydat$pval_D < 0.05 & mydat$es_D > 1)
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx], col = "#A6D85460", pch = 16)
+idx <- which(mydat$noise == FALSE & mydat$significant_massFeature_D == TRUE & !is.na(mydat$target_name))
+points(mydat$es_D[idx], -log10(mydat$pval_D)[idx],col = "#036ffc60", bg="#036ffc", pch = 24) #THUS THIS WORK, it should mark the mass features that were also selected as statsitically significan based on lowest p value and highest abs es value
+```
+
+# Boxplots
+
+```{r}
+mydat <- mydat %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled sampels and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+
+data_distrib <- mydat %>%
+  select(c("name", "data2", "noise", "target_name")) %>%
+  filter(noise == FALSE) %>%
+  filter(!is.na(target_name)) %>% 
+    unnest(data2) %>%
+   select(c("target_name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "id", values_from = "norm_indiv_i") %>%
+  column_to_rownames("target_name")
+
+df <- as.data.frame(t(data_distrib)) #transform table
+df$groups<-rownames(df) #we add coume groups in which we write name of the compunds
+df$groups <- gsub('[[:digit:]]+', '', df$groups) #iz stolpca izbrisemo stevilke
+df$groups <- gsub("_", "", df$groups)#iz stolpca izbrisemo _
+#naredimo for loop, iteriramo cez vsak stolpec razen zadnjega kjer imamo group in izrisemo graf
+
+write_xlsx(df,"normalized intensity of AnnComp.xlsx") #write excel file with normalized intensity of anncom
+
+for(i in seq(ncol(df)-1)){ 
+  #naredimo for zanko, spremenljivka i bo zavzela vrednost med 1 in st vrstic -1, i je stevilka stolpca
+print(ggplot(df, aes(x=groups, df[,i])) + 
+    theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+          geom_jitter(aes(color=groups), width=0.2, height=0, size=3, show.legend = FALSE)+
+      ylim(0, 10)+
+    xlab("group")+
+    ylab("normalized intensity")+
+  ggtitle(paste(colnames(df[i]), ionsdb$ion_adduct)))
+}
+```
+
+# Report
+
+```{r}
+ mydat_significant_rows <- mydat %>%
+        filter(significant_massFeature_PS==TRUE | significant_massFeature_PF==TRUE | significant_massFeature_D==TRUE)
+#datatable(mydat_significant_rows[,c("name", "mz", "RT", "target_name", "target_activity", "target_abc",
+ #                    "target_level", "target_comment", 
+ #                    "target_mode", "score", "ppm_error", "score_rt", "significant_massFeature_PS", "significant_massFeature_PF",    #"significant_massFeature_D")])
+
+SignMassFeature = mydat_significant_rows[,c("name", "mz", "RT", "target_name", "target_activity", "target_abc",
+                     "target_level", "target_comment", 
+                     "target_mode", "score", "ppm_error", "score_rt", "significant_massFeature_PS", "significant_massFeature_PF",    "significant_massFeature_D")]
+
+datatable(SignMassFeature)
+
+#write.xlsx(SignMassFeature, "C:\\Users\\Administrator\\Desktop\\ana\\SignMassFeature_table.xlsx")
+write_xlsx(SignMassFeature, "SignMassFeature_table.xlsx")
+
+
+   mydat_AnnComp <- mydat %>%
+        filter(!is.na(mydat$target_name))
+ #datatable(mydat_AnnComp[,c("name", "mz", "RT", "target_name", "target_activity", "target_abc",
+ #                    "target_level", "target_comment", 
+  #                   "target_mode", "score", "ppm_error", "score_rt", "pval_PS", "es_PS", "pval_PF", "es_PF", "pval_D", "es_D")])
+
+AnnComp = mydat_AnnComp[,c("name", "mz", "RT", "target_name", "target_activity", "target_abc",
+                     "target_level", "target_comment", 
+                     "target_mode", "score", "ppm_error", "score_rt", "pval_PS", "es_PS", "pval_PF", "es_PF", "pval_D", "es_D")]
+
+datatable(AnnComp)
+
+write_xlsx(data, "intensity_table.xlsx")
+```
+
+# Session information
+
+```{r session}
+Sys.time()-startpoint
+#devtools::session_info()
+```
