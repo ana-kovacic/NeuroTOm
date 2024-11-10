@@ -13,7 +13,7 @@ startpoint <- Sys.time()
 ```
 
 
-# Libraries
+# Librarie
 
 ```{r}
 p <- "NEG"
