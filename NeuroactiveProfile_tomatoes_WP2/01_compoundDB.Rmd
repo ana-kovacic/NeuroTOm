@@ -1,0 +1,153 @@
+---
+title: "CompoundDb"
+author: "Mar Garcia-Aloy"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+https://rformassspectrometry.github.io/CompoundDb/articles/create-compounddb.html#compdb-from-custom-data
+
+```{r, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r, message=FALSE}
+db <- "AnnComp" # "stds" "SL" "MS2_ann", AnnComp
+
+library(readxl)
+library(MetaboCoreUtils)
+library(CompoundDb)
+```
+
+
+# Data import
+
+```{r import}
+if(file.exists(paste0("rdata/CompDb_tomato_", db, ".sqlite"))){
+  file.remove(paste0("rdata/CompDb_tomato_", db, ".sqlite"))
+}
+if(db == "stds"){
+  cmps <- read_xlsx("data/standards.xlsx")
+} else if (db == "SL"){
+  cmps <- read.csv("data/SuspectList_3rd_200223.csv")
+} else if (db == "AnnComp"){
+  cmps <- read_xlsx("data/AnnotatedCompounds_AnnComp.xlsx")
+} else if(db == "MS2_ann"){
+  cmps <- read_xlsx("data/AnnotatedCompounds_SL.xlsx")
+}
+
+cmps$mass <- calculateMass(cmps$formula)
+```
+
+
+# Compound DB building
+
+Create a `CompDb` database from automatically defined compounds.  
+Create a `data.frame` with compound information of candidate neuroactive compound.   
+The data needs to have the following information "compound_id", "name", 
+"inchi", "inchikey", "formula", "exactmass", "synonyms".  
+All columns except "compound_id" can also contain missing values.    
+It is also possible to define additional columns.  
+
+```{r cmpdb}
+if(db == "SL"){
+  tmp_rt <- rep(0, nrow(cmps))
+} else {
+  tmp_rt <- cmps$RT
+}
+
+cmps <- data.frame(
+  compound_id = paste0(
+    "C", formatC(seq(nrow(cmps)), width = nchar(nrow(cmps)), flag = "0")),
+  name = cmps$name,
+  inchi = NA_character_,
+  inchikey = NA_character_,
+  formula = cmps$formula,
+  exactmass = cmps$mass,
+  synonyms = NA_character_,
+  rtime = tmp_rt,
+  adduct = c("[M-H]-; [M+H]+"),
+  comment = cmps$comment,
+  activity = cmps$activity,
+ level = cmps$level,
+ mode = cmps$mode,
+ abc = cmps$group
+)
+```
+
+
+It is also required to define *metadata* for the database with the 
+`make_metadata` function.
+
+```{r metad}
+metad <- make_metadata(source = "pomodoro", url = "",
+                       source_version = "", 
+                       source_date = Sys.Date(),
+                       organism = NA_character_)
+```
+
+With this information we can already create the `CompDb` database.
+
+```{r dbfile}
+db_file <- createCompDb(cmps, metadata = metad, path = "rdata/", 
+                        dbFile = paste0("CompDb_tomato_", db, ".sqlite"))
+```
+
+Below we load this database using the `CompDb` function in read-write mode 
+because we want to add more information to this database later.
+
+```{r cdb}
+(cdb <- CompDb(db_file, flags = RSQLite::SQLITE_RW))
+```
+
+Next step is to create and `IonDb` database, which extends the `CompDb` by 
+adding additional database tables to support ion annotations.
+
+```{r idb}
+idb <- IonDb(cdb)
+```
+
+Below we define a data frame with ion annotations and add that to the database 
+with the `insertIon` function. The ion annotations are associated with the 
+class of lipid. The column "compound_id" needs to contain the identifiers of 
+the compounds to which the ion should be related to.
+
+```{r idb2}
+for(i in seq(nrow(cmps))){
+  x <- unlist(strsplit(cmps$adduct[i], "; "))
+  ion <- data.frame(
+    compound_id = rep(cmps$compound_id[i], length(x)),
+    ion_adduct = x,
+    ion_mz = rep(NA, length(x)),
+    ion_rt = rep(cmps$rtime[i], length(x))
+  )
+  for(j in seq(nrow(ion))){
+    ion$ion_mz[j] <- mass2mz(cmps$exactmass[i], x[j])
+  }
+  idb <- insertIon(idb, ion)
+}
+```
+
+
+# Save the output
+
+```{r save}
+ionsdb <- ions(idb, c(
+  "compound_id", "name", "ion_adduct", "ion_mz", "ion_rt", "comment", "activity", "level", "mode", "abc"))
+save(ionsdb, file = paste0("rdata/ionsdb_", db, ".RData"))
+```
+
+
+# Session info
+
+```{r session-info}
+Sys.time()-startpoint
+devtools::session_info()
+```
+

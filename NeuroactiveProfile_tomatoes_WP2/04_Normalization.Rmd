@@ -1,0 +1,208 @@
+---
+title: "Normalization"
+author: "Mar Garcia-Aloy"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+```{r start, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r libraries}
+p <- "NEG"
+software <- "progenesis" #progenesis / mzmine
+myfile <- "data/ANA_MSE_POS_ALL_MASS_PROG.xlsx" #"data/ANA_MSE_POS_MZMINE_30ppm.xlsx" #"data/ANA_MSE_POS_ALL_MASS_PROG.xlsx"
+
+library(readxl)
+library(MetaboAnnotation)
+library(plotly)
+
+rsd <- function(x){(sd(x) / mean(x))*100}
+```
+
+
+# Data import
+
+```{r import}
+if(software == "progenesis"){
+  feat <- read_xlsx(myfile, skip = 2) #SKIP first two empty rows 
+  
+  tmp <- read_xlsx(myfile)
+  
+  # select normalized data:
+  data_norm <- feat[, grep("Normalised", colnames(tmp)):(grep("Raw", colnames(tmp))-1)]
+  
+  # select raw data:
+  data_raw <- feat[, grep("Raw", colnames(tmp)):(grep("Not identified", tmp[2,])-1)]
+  
+  feat <- data.frame(feat[,c(3, 5)])
+  colnames(feat) <- c("mz", "RT")
+  
+  rm(tmp)
+} else if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data_raw <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data_raw) <- feat$FT
+data_raw <- data.frame(t(data_raw))
+if(software == "progenesis"){
+  rownames(data_norm) <- feat$FT
+  data_norm <- data.frame(t(data_norm))
+}
+```
+
+
+# PQN normalization
+
+```{r}
+idx <- grep("QC", rownames(data_raw))
+dt_ref <- data_raw[idx, ]
+dt_ref <- apply(dt_ref, 2, median)
+
+pqn_factor <- rep(NA, nrow(data_raw))
+for(i in seq(nrow(data_raw))){
+  # 3. Calculate the quotients of all variables of interest of the test spectrum with those of the reference spectrum.
+  tmp_pqn <- as.numeric(data_raw[i,] / dt_ref)
+  # 4. Calculate the median of these quotients.
+  pqn_factor[i] <- median(tmp_pqn[tmp_pqn > 0], na.rm = T)
+}
+
+data_pqn <- sweep(data_raw, MARGIN = 1, pqn_factor, `/`)
+
+rm(idx, dt_ref, i, tmp_pqn, pqn_factor)
+```
+
+
+# Annotation
+
+```{r}
+load("rdata/ionsdb_stds.RData")
+ionsdb_stds <- ionsdb
+load("rdata/ionsdb_MS2_ann.RData")
+ionsdb <- rbind(ionsdb_stds, ionsdb)
+rm(ionsdb_stds)
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+
+pr <- MzRtParam(tolerance = 0.01, toleranceRt = 0.15) # define the parameters
+mt_ft <- matchValues(feat, ionsdb, param = pr, 
+                     rtColname = c("RT", "ion_rt"),
+                     mzColname = c("mz", "ion_mz"))
+mtft_df <- data.frame(matchedData(mt_ft))
+mtft_df <- mtft_df[!is.na(mtft_df$target_name),]
+```
+
+
+# Individual plots
+
+```{r plots, results='asis'}
+smpl_class <- rep("sample", nrow(data_raw))
+smpl_class[grep("QC", rownames(data_raw))] <- "QC"
+smpl_class[grep("Blank|PPB", rownames(data_raw))] <- "blank"
+idx_QC <- grep("QC", rownames(data_raw))
+smpl_order <- as.numeric(substr(rownames(data_raw), 13, 14))
+if(software == "progenesis"){
+  out <- data.frame(matrix(nrow = nrow(mtft_df), ncol = 4))
+  colnames(out) <- c("name", "raw", "PQN", "pr_norm")
+}else if(software == "mzmine"){
+  out <- data.frame(matrix(nrow = nrow(mtft_df), ncol = 3))
+  colnames(out) <- c("name", "raw", "PQN")
+}
+out$name <- mtft_df$target_name
+
+htmltools::tagList(
+  plot_ly(data = mtft_df, x = ~RT, y = ~mz,
+          text = ~target_name)
+)
+
+for(i in seq(nrow(mtft_df))){
+  print(mtft_df$target_name[i])
+  idx_FT <- which(feat$FT == mtft_df$FT[i])
+  print(htmltools::tagList(
+    plot_ly(x = smpl_order, y = data_raw[,idx_FT], 
+            color = smpl_class, colors = "Set1", size = 2,
+            text = rownames(data_raw)) %>%
+      layout(title = paste0("Raw data \n RSD = ", 
+                            round(rsd(data_raw[idx_QC, idx_FT])), "%"))
+  ))
+  out[i, "raw"] <- rsd(data_raw[idx_QC, idx_FT])
+  print(htmltools::tagList(
+    plot_ly(x = smpl_order, y = data_pqn[,idx_FT], 
+            color = smpl_class, colors = "Set1", size = 2,
+            text = rownames(data_pqn)) %>%
+      layout(title = paste0("PQN data \n RSD = ", 
+                            round(rsd(data_pqn[idx_QC, idx_FT])), "%"))
+  ))
+  out[i, "PQN"] <- rsd(data_pqn[idx_QC, idx_FT])
+  if(software == "progenesis"){
+    print(htmltools::tagList(
+      plot_ly(x = smpl_order, y = data_norm[,idx_FT], 
+              color = smpl_class, colors = "Set1", size = 2,
+            text = rownames(data_norm)) %>%
+        layout(title = paste0("Progenesis-normalized data \n RSD = ", 
+                              round(rsd(data_norm[idx_QC, idx_FT])), "%"))
+    ))
+      out[i, "pr_norm"] <- rsd(data_norm[idx_QC, idx_FT])
+  }
+}
+```
+
+
+# Summary output
+
+```{r}
+out$raw <- round(out$raw)
+out$PQN <- round(out$PQN)
+if(software == "progenesis"){
+  out$pr_norm <- round(out$pr_norm)
+}
+DT::datatable(out)
+
+if(software == "progenesis"){
+  out_l <- tidyr::gather(out, method, value, raw:pr_norm)
+} else if(software == "mzmine"){
+  out_l <- tidyr::gather(out, method, value, raw:PQN)
+}
+out_l <- out_l[!is.na(out_l$value),]
+
+set.seed(123)
+rnd <- runif(nrow(out_l), -0.2, 0.2)
+plot_ly(data = out_l, x = ~as.numeric(as.factor(method)) + rnd, y = ~value,
+        color = ~method, text = paste(out_l$name, out_l$method)) %>%
+  layout(xaxis = list(title = "Normalization method"),
+         yaxis = list(title = "RSD (%)"))
+feat <- mtft_df
+if(software == "progenesis"){
+  save(feat, data_raw, data_pqn, data_norm, 
+       file = paste0("rdata/norm_data_progenesis_", p, ".RData"))
+} else if(software == "mzmine"){
+  out_l <- tidyr::gather(feat, out, method, value, raw:PQN, 
+       file = paste0("rdata/norm_data_mzmine_", p, ".RData"))
+}
+
+```
+
+
+# Session info
+
+```{r session-info}
+Sys.time()-startpoint
+devtools::session_info()
+```
+

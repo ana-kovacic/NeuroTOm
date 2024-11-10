@@ -1,0 +1,63 @@
+---
+title: "MS2 Import"
+author: "AnaK"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    toc: false
+    number_sections: false
+    toc_float: false
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(Spectra)
+
+#we havet to correct the precursor 
+#if we wood adjust the code to be a for loop it would be faster 
+for(p in "POS"#c("NEG", "POS")
+    ){
+  fls <- list.files("data", recursive = TRUE, full.names = TRUE)
+  fls <- fls[grep("DDA", fls)]
+  fls <- fls[grep(p, fls)]
+  fls <- fls[grep("\\.mzML", fls)]
+  
+  ms2 <- Spectra(fls, backend = MsBackendDataFrame())
+  
+#correct precursor of ms2
+  pmz <- estimatePrecursorMz(ms2, tolerance = 0.3, ppm = 10, BPPARAM = SerialParam()) #correct the precursor of ms2
+  #ploting the corrected and not corrected precursor 
+plot(precursorMz(ms2), pmz)
+plot(precursorMz(ms2), precursorMz(ms2) - pmz, xlab = "precursor m/z",
+     ylab = "difference reported - estimated precursor m/z")
+ms2$precursorMz <- pmz
+
+  ms2 <- ms2[msLevel(ms2) > 1]
+  
+  spectral_entropy <- function(x){
+    y <- x / sum(x)
+    z <- y*log(y)
+    return(-sum(z))
+  }
+  normalized_entropy <- function(x){
+    spectral_entropy(x) / log(length(x))
+  }
+  
+  ms2$entropy <- unlist(lapply(intensity(ms2), spectral_entropy))
+  ms2$entropy_norm <- unlist(lapply(intensity(ms2), normalized_entropy))
+  
+  save(ms2, file = paste0("rdata/", p, "_MS2spectra.RData"))
+}
+```
+
+
+# Session information
+
+```{r session}
+Sys.time()-startpoint
+devtools::session_info()
+```
