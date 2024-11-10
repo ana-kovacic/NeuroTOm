@@ -1,0 +1,385 @@
+---
+title: "test_calibration2"
+author: "AnaK"
+date: "2024-02-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(writexl)
+library(tidyr)
+library(ggpubr)
+library(viridis)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(svglite)
+library(reshape)
+library(tidyverse)
+library(ggtext)
+library(purrr)
+library(data.table)
+
+```
+
+# blank substraction and data organisation
+
+```{r}
+df_raw <- read_excel("./test_calibrationR_all.xlsx")
+df3 = data.frame(matrix(nrow = nrow(df_raw)-3, ncol = ncol(df_raw))) #creat an empty dataframe
+ df3
+ colnames(df3) <- colnames(df_raw) #name the coumes as raw data frame
+ colnames(df3)[1] <- "Concentration"
+ df3$Concentration <- NA
+ df3$Concentration <- df_raw$`Sample Name`[4:nrow(df_raw)]#exclude blanks row 
+ 
+
+#for loop to calculate the average of blank and substract them from calibration points
+ for (i in seq(2,ncol(df_raw))) {
+  average <- apply(df_raw[ c("1", "2", "3"),i], 2, mean,na.rm = TRUE)
+  df3[i] <- df_raw[4:nrow(df_raw),i]-average
+ }
+  df3 <- subset(df3, select = -`Ascorbic acid`) #exclude the compounds that were our of linearity
+  
+ df3_new <- df3                    # Duplicate data frame
+df3_new[df3_new < 0] <- NA       # Replace negative values by NA
+df3_new 
+df3_new$`Linoleic acid`[1:36] <- NA
+rm(df3) #remove no more needed data
+```
+# calibration curves
+
+```{r}
+df3_new$Concentration <- as.numeric(df3_new$Concentration)
+w=1/as.numeric(df3_new$Concentration) #weighted calibration curve
+
+df_calibra_param = data.frame(matrix(nrow = 3, ncol = ncol(df3_new)))
+ colnames(df_calibra_param) <-  colnames(df3_new) #name the coumes as raw data frame
+ colnames(df_calibra_param)[1] <- "parameter"
+ df_calibra_param$parameter[1] = 'k' 
+ df_calibra_param$parameter[2] = 'n' 
+  df_calibra_param$parameter[3] = 'r2' 
+
+for (i in seq(2,ncol(df3_new))) {
+  weighted_calcurve = lm(df3_new[,i] ~ df3_new$Concentration, weights = w)
+  coeff=coefficients(weighted_calcurve)
+  eq = paste0("y = ", round(coeff[2],3), "*x ", round(coeff[1],3))
+  r2 = paste0("R2 = ", round(summary(weighted_calcurve)$r.squared,3))
+  plot(df3_new$Concentration, df3_new[,i], pch = 19, col = "blue", cex = 0.5, main=colnames(df3_new[i]), sub=paste0(eq,", ",r2), xlab = "Concentration", ylab = "Response") +
+    abline(weighted_calcurve, col = "red")
+  df_calibra_param[1,i]=coeff[2]
+  df_calibra_param[2,i]=coeff[1]
+    df_calibra_param[3,i]=summary(weighted_calcurve)$r.squared
+}
+
+  write_xlsx(df_calibra_param, "./CalibrationParameters.xlsx")
+    write_xlsx(df3_new, "./CalibrationCurve.xlsx")
+```
+
+
+# calculate concentration
+
+
+```{r}
+df_donor <- read_csv("./Donor6_areaRatio_D.csv") #load the data from area ratio of each donor
+df_LOQ <- read_csv("./LOQ_Final.csv") #load the data of compound loq based on the calibration curves
+ #df_LOQ <- subset(df_LOQ, select = -`SampleName`)
+#df_LOQ <- as.data.frame(lapply(df_LOQ,as.numeric))
+
+#creat a new data frame with calculated conc
+df_donor <- as.data.frame(df_donor)
+df_donor[df_donor == 0] <- NA
+
+df_donor = setNames(data.frame(t(df_donor[,-1])), df_donor[,1])
+ df_donor <- subset(df_donor, select = -`Ascorbic acid`) #exclude the compounds that were our of linearity
+
+df_donor_conc = data.frame(matrix(nrow = nrow(df_donor), ncol = ncol(df_donor))) #creat an empty dataframe
+ df_donor_conc
+ colnames(df_donor_conc) <- colnames(df_donor) #name the coumes as raw data frame
+ #colnames(df_donor_conc)[1] <- "Sample"
+ #df_donor_conc$Sample <- NA
+ #df_donor_conc$Sample <-  row.names((df_donor))#exclude blanks row 
+ rownames(df_donor_conc) = rownames(df_donor)
+
+ 
+ #for loop to calculate the concentration using calibration curves
+ for (i in colnames(df_donor_conc)) {
+df_donor_conc[i] = ((df_donor[i] - df_calibra_param[2,i]) / df_calibra_param[1,i])*5
+#df_donor_conc[i] <- ifelse(df_donor_conc[i] %in% df_donor_conc[i]<df_LOQ[i], df_donor_conc[i]=0)
+df_donor_conc[i][df_donor_conc[i]<df_LOQ[[1,i]]]=NA
+
+
+
+ }
+ 
+ #df_donor_conc <- as.data.frame(df_donor_conc) 
+  #df_donor_conc <- cbind("SampleName"=rownames(df_donor_conc), df_donor_conc)
+writexl::write_xlsx(cbind("SampleName"=rownames(df_donor_conc), df_donor_conc), "Donor6_CalConcentration_combined.xlsx")
+
+```
+
+# combining all donor into one dataframe
+
+```{r}
+DataAlla_CalConc_donors <- list.files(pattern = "*combined.xlsx") %>% 
+  map_dfr(read_excel)
+
+abc <- as.data.frame(t(DataAlla_CalConc_donors[,-1]))
+colnames(abc) <- DataAlla_CalConc_donors$SampleName #now abc1 and abc the same
+tmp <- cbind(rownames(abc), abc)
+colnames(tmp)[1] = "SampleName"
+  rownames(tmp) = seq(1,nrow(tmp))
+
+areaslongA_all <- gather(tmp,aliquottime, c, colnames(tmp)[2]:colnames(tmp)[ncol(tmp)])
+  areaslongA_all$time <- as.numeric(unlist(lapply(strsplit(areaslongA_all$aliquottime, "_"), `[[`, 3)))
+  areaslongA_all$Type <- as.factor(unlist(lapply(strsplit(areaslongA_all$aliquottime, "_"), `[[`, 2)))
+    areaslongA_all$Donor <- as.factor(unlist(lapply(strsplit(areaslongA_all$aliquottime, "_"), `[[`, 1)))
+areaslongA_all$aliquottime<- as.factor(areaslongA_all$aliquottime)
+    areaslongA_all$SampleName<- as.factor(areaslongA_all$SampleName)
+      areaslongA_all$Donor<- as.factor(areaslongA_all$Donor)
+       areaslongA_all$Type<- as.factor(areaslongA_all$Type)
+    areaslongA_all[is.na(areaslongA_all)] <- 0
+    areaslongA_all$c[areaslongA_all$c < 0] <- 0
+  
+  writexl::write_xlsx(areaslongA_all, "AllSamples_concentrations.xlsx")
+
+      areaslongA_qc  <- subset(areaslongA_all,Type=='qc' ) #removing qc
+  areaslongA_sample <- areaslongA_all[!((areaslongA_all$Type) %in% c("qc")),]
+  areaslongA_sample <- droplevels(areaslongA_sample)
+  areaslongA_qc <- droplevels(areaslongA_qc)
+
+areaslongA_tomato <- areaslongA_sample %>% #filteringonly tomato samples
+        filter(grepl('Tomato', Type))
+ areaslongA_tomato <- droplevels(areaslongA_tomato)
+ rm(abc, tmp) #remove non more needed files
+```
+
+## Including Plots - theme
+
+```{r}
+
+#these for the selected styl in future ####
+theme1 <- theme(axis.line = element_line(colour = "black"),
+                panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                panel.border = element_blank(),
+                panel.background = element_blank(),
+                axis.title.x = element_text(size = 10,
+                                   color = "black"),
+                axis.title.y = element_text(size = 10,
+                                   color = "black"),)
+```
+
+##Plots - PerType
+
+```{r}
+
+#Function that generate all graphs on the same figure ####
+getgraph1 <- function(df_type, df_donor){ #funkciji samo dva argumenta, eno je df kjer so nasi podatki, df_pogoj pa je pogoj - vessel, torej izvedlo se bo za vsak pogoj vsi sample names
+  pl <- list()
+  i <- 1
+  print(levels(df_type$SampleName))
+  for (mz in levels(df_type$SampleName)){ #mz je ime spojine
+    title
+    print(i)
+    print(length(pl))
+    pl[[i]] <- ggplot(df_type[df_type$SampleName==mz & df_type$Donor == df_donor,],aes(x=time, y=c, color=Type))+ #izrisi graf za mz in dolocen pogoj, mz pa je lista vseh
+      scale_color_viridis(discrete = TRUE, option = "D", limits = levels(df_type$Type))+
+      scale_fill_viridis(discrete = TRUE)+ # <- this fixates colors for levels
+      geom_point()+
+      geom_line()+
+      theme_bw()+
+      ggtitle(mz)+
+      labs(x = "t [h]", y ="Concentration [ppm]")+
+      theme1+
+      theme(plot.title = ggtext::element_markdown(ggtext::element_markdown(hjust = 0.5),
+                                                  # margin = margin(t = 15, r=0, b = -25, l=0),
+                                                  size=10),)
+    i <- i+1
+  }
+  pl
+}
+
+#SAVE ALL GRAPHS #### #shranimo vse grafe za posamezne spojine na slike, ki ustrezajo pogoju
+for (df_donor in levels(areaslongA_sample$Donor)){
+  #(currently command for saving plots is disabled)
+  DI <- getgraph1(areaslongA_sample, df_donor)
+  # BPFslow <- BPFslow[c(1,2, 4, 6, 5)] #rearange positions
+  DI2 <- ggarrange(plotlist =  DI, ncol=6, nrow=6, common.legend = TRUE, legend="bottom")
+  #DI2
+  ggsave(plot = DI2, filename = paste("PerType_graphs/Concentration_kinetics_",df_donor,".png"),dpi=400, width = 20, height = 12)
+}
+
+```
+
+##Tomato Variability
+```{r}
+areaslongA_tomato_average <- areaslongA_sample %>%
+        filter(grepl('Tomato1|Tomato2|Tomato3', Type) & grepl('D5|D4|D6', Donor))
+
+areaslongA_tomato_average_long <- areaslongA_tomato_average %>% 
+  separate(Type, into = c('sample', 'paralel'), sep = 6)
+
+setDT(areaslongA_tomato_average_long)[, Mean := mean(c), by = .(SampleName, time, Donor)][]
+setDT(areaslongA_tomato_average_long)[, std := sd(c), by = .(SampleName, time, Donor)][]
+areaslongA_tomato_average_long$RSD <- ((areaslongA_tomato_average_long$std / areaslongA_tomato_average_long$Mean)*100)
+areaslongA_tomato_average_long$outliers <- ifelse(areaslongA_tomato_average_long$RSD >= 30, "BAD", "GOOD" )
+
+areaslongA_tomato_average_long_fitered <- areaslongA_tomato_average_long %>% 
+  distinct(SampleName, Mean, time, Donor, std, RSD, .keep_all = TRUE)
+
+#saveRDS(areaslongA_tomato_average_long, file="FecalFermModel_repetability.Rda")
+writexl::write_xlsx(areaslongA_tomato_average_long, "TomatoVariability.xlsx")
+writexl::write_xlsx(areaslongA_tomato_average_long_fitered, "TomatoVariability_filtered.xlsx")
+
+#Function that generate all graphs on the same figure ####
+getgraph1 <- function(df_type, df_donor){ #funkciji samo dva argumenta, eno je df kjer so nasi podatki, df_pogoj pa je pogoj - vessel, torej izvedlo se bo za vsak pogoj vsi sample names
+  pl <- list()
+  i <- 1
+  print(levels(df_type$SampleName))
+  for (mz in levels(df_type$SampleName)){ #mz je ime spojine
+    title
+    print(i)
+    print(length(pl))
+    pl[[i]] <- ggplot(df_type[df_type$SampleName==mz & df_type$Donor == df_donor,],aes(x=time, y=c, color=Type))+ #izrisi graf za mz in dolocen pogoj, mz pa je lista vseh
+      scale_color_viridis(discrete = TRUE, option = "D", limits = levels(df_type$Type))+
+      scale_fill_viridis(discrete = TRUE)+ # <- this fixates colors for levels
+      geom_point()+
+      geom_line()+
+      theme_bw()+
+      ggtitle(mz)+
+      labs(x = "t [h]", y ="Concentration [ppm]")+
+      theme1+
+      theme(plot.title = ggtext::element_markdown(ggtext::element_markdown(hjust = 0.5),
+                                                  # margin = margin(t = 15, r=0, b = -25, l=0),
+                                                  size=10),)
+    i <- i+1
+  }
+  pl
+}
+
+#SAVE ALL GRAPHS #### #shranimo vse grafe za posamezne spojine na slike, ki ustrezajo pogoju
+for (df_donor in levels(areaslongA_tomato$Donor)){
+  #(currently command for saving plots is disabled)
+  DI <- getgraph1(areaslongA_tomato, df_donor)
+  # BPFslow <- BPFslow[c(1,2, 4, 6, 5)] #rearange positions
+  DI2 <- ggarrange(plotlist =  DI, ncol=6, nrow=6, common.legend = TRUE, legend="bottom")
+  #DI2
+  ggsave(plot = DI2, filename = paste("TomatoOnly_graphs/Concentration_kinetics_",df_donor,".png"),dpi=400, width = 20, height = 12)
+}
+
+
+```
+
+##Plots - PerDonor
+```{r}
+
+#Function that generate all graphs on the same figure ####
+getgraph1 <- function(df, df_pogoj){ #funkciji samo dva argumenta, eno je df kjer so nasi podatki, df_pogoj pa je pogoj - vessel, torej izvedlo se bo za vsak pogoj vsi sample names
+  pl <- list()
+  i <- 1
+  print(levels(df$SampleName))
+  for (mz in levels(df$SampleName)){ #mz je ime spojine
+    title
+    print(i)
+    print(length(pl))
+    pl[[i]] <- ggplot(df[df$SampleName==mz & df$Type == df_pogoj,],aes(x=time, y=c, color=Donor))+ #izrisi graf za mz in dolocen pogoj, mz pa je lista vseh
+      scale_color_viridis(discrete = TRUE, option = "D", limits = levels(df$Donor))+
+      scale_fill_viridis(discrete = TRUE)+ # <- this fixates colors for levels
+      geom_point()+
+      geom_line()+
+      theme_bw()+
+      ggtitle(mz)+
+      labs(x = "t [h]", y ="Concentration [ppm]")+
+      theme1+
+      theme(plot.title = ggtext::element_markdown(ggtext::element_markdown(hjust = 0.5),
+                                                  # margin = margin(t = 15, r=0, b = -25, l=0),
+                                                  size=10),)
+    i <- i+1
+  }
+  pl
+}
+
+#SAVE ALL GRAPHS #### #shranimo vse grafe za posamezne spojine na slike, ki ustrezajo pogoju
+for (pogoj in levels(areaslongA_all$Type)){
+  #(currently command for saving plots is disabled)
+  DI <- getgraph1(areaslongA_all, pogoj)
+  # BPFslow <- BPFslow[c(1,2, 4, 6, 5)] #rearange positions
+  DI2 <- ggarrange(plotlist =  DI, ncol=6, nrow=6, common.legend = TRUE, legend="bottom")
+  #DI2
+  ggsave(plot = DI2, filename = paste("PerDonor_graphs/Concentration_kinetics_",pogoj,".png"),dpi=400, width = 20, height = 12)
+}
+```
+
+##qc calculation and plots
+```{r}
+
+areaslongA_qc_average <- areaslongA_qc 
+
+setDT(areaslongA_qc_average)[, Mean := mean(c), by = .(SampleName, Donor)][]
+setDT(areaslongA_qc_average)[, std := sd(c), by = .(SampleName, Donor)][]
+areaslongA_qc_average$RSD <- ((areaslongA_qc_average$std / areaslongA_qc_average$Mean)*100)
+areaslongA_qc_average$outliers <- ifelse(areaslongA_qc_average$RSD >= 30, "BAD", "GOOD" )
+
+areaslongA_qc_average_filtered <- areaslongA_qc_average %>% 
+  distinct(SampleName, Mean, Donor, std, RSD, .keep_all = TRUE)
+
+#saveRDS(areaslongA_tomato_average_long, file="FecalFermModel_repetability.Rda")
+writexl::write_xlsx(areaslongA_qc_average_filtered, "qc_calculations_Filtered.xlsx")
+writexl::write_xlsx(areaslongA_qc_average, "qc_calculations.xlsx")
+
+
+#Function that generate all graphs on the same figure ####
+getgraph1 <- function(df_type, df_donor){ #funkciji samo dva argumenta, eno je df kjer so nasi podatki, df_pogoj pa je pogoj - vessel, torej izvedlo se bo za vsak pogoj vsi sample names
+  pl <- list()
+  i <- 1
+  print(levels(df_type$SampleName))
+  for (mz in levels(df_type$SampleName)){ #mz je ime spojine
+    title
+    print(i)
+    print(length(pl))
+    temp = df_type[df_type$SampleName==mz & df_type$Donor == df_donor,]
+    pl[[i]] <- ggplot(temp,aes(x=time, y=c, color=Type))+ #izrisi graf za mz in dolocen pogoj, mz pa je lista vseh
+      scale_color_viridis(discrete = TRUE, option = "D", limits = levels(df_type$Type))+
+      scale_fill_viridis(discrete = TRUE)+ # <- this fixates colors for levels
+      geom_point()+
+      geom_line()+
+      geom_area(alpha = 0.1, fill = "orange") + 
+      scale_y_continuous(limits = c(0, max(max(temp$c),mean(temp$c)*1.3))) + #if running this then the graphs are with integrated area from 0 to max y, how can i do for max y per sample name?
+      geom_hline(yintercept=mean(temp$c), color = "red")+
+      geom_hline(yintercept=mean(temp$c)*0.7, linetype="dashed", color = "black")+
+      geom_hline(yintercept=mean(temp$c)*1.3, linetype="dashed", color = "black")+
+      theme_bw()+
+      ggtitle(mz)+
+      labs(x = "inj order", y ="Concentration [ppm]")+
+      theme1+
+      theme(plot.title = ggtext::element_markdown(ggtext::element_markdown(hjust = 0.5),
+                                                  # margin = margin(t = 15, r=0, b = -25, l=0),
+                                                  size=10),)
+    i <- i+1
+  }
+  pl
+}
+
+#SAVE ALL GRAPHS #### #shranimo vse grafe za posamezne spojine na slike, ki ustrezajo pogoju
+for (df_donor in levels(areaslongA_qc_average$Donor)){
+  #(currently command for saving plots is disabled)
+  DI <- getgraph1(areaslongA_qc_average, df_donor)
+  # BPFslow <- BPFslow[c(1,2, 4, 6, 5)] #rearange positions
+  DI2 <- ggarrange(plotlist =  DI, ncol=6, nrow=6, common.legend = TRUE, legend="bottom", align = c("h"))
+  #DI2
+  ggsave(plot = DI2, filename = paste("qc_graphs/Concentration_kinetics_test2",df_donor,".png"),dpi=400, width = 20, height = 12)
+}
+
+
+
+```

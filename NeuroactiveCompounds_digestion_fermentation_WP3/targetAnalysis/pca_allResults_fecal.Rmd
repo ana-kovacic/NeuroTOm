@@ -1,0 +1,154 @@
+---
+title: "pca_fecal_target"
+author: "AnaK"
+date: "2024-05-15"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+```
+
+# R Markdown
+
+# Libraries
+
+```{r}
+library(plotly)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+
+myimputer <- function(v){
+  set.seed(123)
+  if(sum(is.na(v)) == 0) {
+    return(v)
+  } else {
+    napos <- which(is.na(v))
+    newval <- runif(length(napos), 0, min(v, na.rm = TRUE))
+    out <- v
+    out[napos] <- newval
+    return(out)
+  }
+}
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+
+```
+
+# PCA
+
+```{r}
+dt_raw <- read_excel("./AllSamples_concentrationsna.xlsx")
+
+data <- dt_raw %>%
+  select(c("Compound", "SampleName", "c")) %>%
+  pivot_wider(names_from = "Compound", values_from = "c") %>% #TAKE NAME from column name and value from norm_indiv_i
+  column_to_rownames("SampleName")
+
+
+data <- data %>% select(where(~ !all(is.na(.)))) #removing columes with NA values only
+#geenrating columes with classes for seperation in pca
+classes_type <- sapply(strsplit(rownames(data), "_"), function(x) x[2])
+classes_type <- factor(classes_type)  # Convert to factor
+data$ClassType <- classes_type
+
+classes_time <- sapply(strsplit(rownames(data), "_"), function(x) x[3])
+classes_time <- factor(classes_time)  # Convert to factor
+data$Classtime <- classes_time
+
+classes_donor <- sapply(strsplit(rownames(data), "_"), function(x) x[1])
+classes_donor <- factor(classes_donor)  # Convert to factor
+data$Classdonor <- classes_donor
+
+pca_results <- data[, -((ncol(data)-2):ncol(data))] #removing last three colume in order to have only data for pca
+#pca_results <- data[, -ncol(data)] #removing last colume
+
+pca_results_i <- apply(pca_results, 2, myimputer)
+pca_results_il <- log10(pca_results_i)
+pca_results_ils <- apply(pca_results_il, 2, scaling.pareto)
+
+pca <- prcomp(pca_results_ils, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+pca_l <- data.frame(pca$rotation)
+pca_s_noQC <- pca_s %>% filter(!grepl("qc", rownames(.)))
+pca_l_noQC <- pca_l %>% filter(!grepl("qc", rownames(.)))
+
+#define that text is the name of the rows
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = data$ClassType,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = data$Classtime,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = data$Classdonor,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+
+plot_ly(data = pca_l, x = ~PC1, y = ~PC2, 
+        text = paste(rownames(pca_l))) %>%
+  layout(title = "Loadings plot")
+```
+
+# PCA no QC
+```{r}
+#DATA WITHOUTH QC SAMPLES
+
+data_noQC <- data %>% filter(!grepl("qc", rownames(.))) #removing columes with qc 
+#geenrating columes with classes for seperation in pca
+
+pca_s_noQC <- pca_s %>% filter(!grepl("qc", rownames(.)))
+pca_l_noQC <- pca_l %>% filter(!grepl("qc", rownames(.)))
+
+#define that text is the name of the rows
+plot_ly(data = pca_s_noQC, x = ~PC1, y = ~PC2, color = data_noQC$ClassType,
+        text = rownames(data_noQC)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s_noQC, x = ~PC1, y = ~PC2, color = data_noQC$Classtime,
+        text = rownames(data_noQC)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+
+plot_ly(data = pca_s_noQC, x = ~PC1, y = ~PC2, color = data_noQC$Classdonor,
+        text = rownames(data_noQC)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+```
+
