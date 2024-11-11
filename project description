@@ -10,3 +10,8 @@ Objective 2 (O2): Increase knowledge about the fate of neuroactive compounds onc
 Hypothesis 2: Neuro-disrupting compounds in tomatoes and their GMMs change the bioavailability of ND related neuroprotective compounds and alter the gut microbiota composition, SCFA and ROS production.
 Objective 3 (O3): Measure the effects of neuroactive substances from a tomato-based diet on IECs and their potential to affect the GBA by using IOs. The results will provide essential information for understanding the impact of dietary nutrition on ND diseases by determining how neuroprotective and neuro-disrupting compounds and their GMMs affect IECs, and, in turn, their uptake. This work will also look at how they will affect the GBA (cell viability, ROS, apoptosis, and intestinal permeability) using a novel 3D in vitro colon organoid alone and in the presence of neurodisrupting compounds. 
 Hypothesis 3: The presence of neuro-disrupting compounds can affect the favourable properties of ND neuroprotective compounds. 
+
+The repository NeuroTOm contains in-house developed scripts in line with the project's aims and questions:
+Developed a non-target workflow for the characterization of the neuroactive compound profile in organic, conventional, and processed tomatoes.
+Developed target and non-target workflows for investigating the fate of neuroactive compounds during digestion, 
+including their metabolic pathways and their effects on the gut microbiome.
