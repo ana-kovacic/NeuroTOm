@@ -1,0 +1,458 @@
+---
+title: "Normalization_dataQuality"
+author: "AnaK"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+```{r start, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r libraries}
+p <- "POS"
+software <- "mzmine" 
+myfile <- "data/Fecal_pos_aligned_blank_2e3.xlsx"
+
+library(tidyverse)
+library(effectsize)
+library(readxl)
+library(MetaboAnnotation)
+library(plotly)
+library(writexl)
+library(RColorBrewer)
+library(DT)
+
+library(MsCoreUtils)
+library(ggplot2)
+
+myimputer <- function(v){
+  set.seed(123)
+  if(sum(is.na(v)) == 0) {
+    return(v)
+  } else {
+    napos <- which(is.na(v))
+    newval <- runif(length(napos), 0, min(v, na.rm = TRUE))
+    out <- v
+    out[napos] <- newval
+    return(out)
+  }
+}
+
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+
+rsd <- function(x){(sd(x) / mean(x))*100}
+```
+
+
+# Data import
+
+```{r import}
+if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data_raw <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data_raw) <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+data_raw <- data.frame(t(data_raw)) #transform data
+```
+# Data Organisation
+```{r}
+#prepare the metadata of the sample names
+md <- gsub(".mzML Peak area", "", rownames(data_raw))
+
+idx <- grep("_QC_0D", md)
+md[idx] <- gsub("_QC_0D", "_QC0D", md[idx])
+rm(idx)
+
+md <- data.frame(do.call(rbind, strsplit(md, "_")))
+colnames(md) <- c("date", "inj_order", "scan", "acquisition", "polarity", "resolution", "batch", "donor", "sample", "time")# Name the columns if needed
+md$filename <- gsub(".mzML Peak area", "", rownames(data_raw))
+idx <- which(md$sample %in% c("QC", "QC0D", "Solvent", "STDMix", "Buffer")) #seperate samples from samples that are not fermentation time dependent 
+md$time[idx] <- 9999 #instead of time contains 9999, also names in the pca 
+md$time <- as.numeric(gsub("h", "", md$time)) #remove h from time, so that it is numeric and can be use for plots 
+rm(idx)
+md  <- md 
+md$inj_order <- as.numeric(str_replace(md$inj_order, "^0+" ,""))
+```
+
+# PQN normalization
+
+```{r}
+idx <- grep("QC_0D", rownames(data_raw)) #take only qc samples for pqn normalisation
+dt_ref <- data_raw[idx, ]
+dt_ref <- apply(dt_ref, 2, median)
+
+pqn_factor <- rep(NA, nrow(data_raw))
+for(i in seq(nrow(data_raw))){
+  # 3. Calculate the quotients of all variables of interest of the test spectrum with those of the reference spectrum.
+  tmp_pqn <- as.numeric(data_raw[i,] / dt_ref)
+  # 4. Calculate the median of these quotients.
+  pqn_factor[i] <- median(tmp_pqn[tmp_pqn > 0], na.rm = T)
+}
+
+data_pqn <- sweep(data_raw, MARGIN = 1, pqn_factor, `/`)
+
+rm(idx, dt_ref, i, tmp_pqn, pqn_factor)
+```
+
+#Normalisation Batch
+```{r}
+ df <- data_raw
+ # first replace 0 with missing value and imput data  
+
+ df[df==0]= NA
+  df <- apply(df, 2, myimputer)
+  
+
+  df <- as.data.frame(cbind(df, md$donor))
+  df <- rename(df, donor = names(df)[ncol(df)])  # Rename last column to 'donor'
+
+ rownames(df) <- NULL
+  df <- df %>%
+    group_by(donor) %>%
+    mutate(across(everything(), as.numeric)) %>%
+    mutate(across(everything(), .fns = function(x) {
+      centered_x <- x - mean(x)  # Center by mean (consider if outliers affect median)
+      scaled_x <- centered_x / mad(x)  # Scale by MAD
+      return(scaled_x)
+    })) %>%
+    ungroup()
+  df <- df[, 1:(ncol(df) - 1)] 
+  rownames(df) <- rownames(data_raw)
+  
+#replace neg values with zero
+   df[df<0]= 0
+  data_norm_batch <- df 
+#rm(df)
+```
+
+#Normalisation median
+```{r}
+#filter data, remove the first injection, first relevant injection is the last of the first QC with injection order = 8  
+dt <- cbind(data_raw, md) %>% #bind the raw data with md
+  as_tibble() %>% #work with tidyverse, for htis case is better 
+  pivot_longer(colnames(data_raw)) %>% #pivot per colnames in order to combine data per feature with nest by name - each feature 
+  nest(data = !c("name")) %>%
+  mutate(data = map(data, function(t){ #with mutate function you generate a new colume aplying the function on the old one, maping in data per feature a new colume
+    t$val_na <- ifelse(t$value == 0, NA, t$value) #a new colume with replaced 0 with na
+    t$value_imp <- myimputer(t$val_na) # a new colume with imputed data
+    t$val_imp_log <- log10(t$value_imp) #a new colume with transformed data
+    t
+  }))
+
+feat2 <- rename(feat, name = FT) #rename the colume name in to have the same colume name for joing 
+dt <- dt %>%
+  left_join(feat2) #JOING TABLE TO HAVE MZ AND RT AS WELL
+rm(feat2)
+
+dt_normMedian <- dt %>%
+  mutate(data_original = data) %>% # the non filtered data 
+  mutate(data = map(data, function(t){ #filtered data
+    t %>%
+      filter(inj_order >= 8)
+  }))
+#normalization median of each feature = 1
+dt_normMedian <- dt_normMedian %>% 
+  mutate(data = map(data, function(t){
+    t <- t %>%
+      group_by(donor) %>%
+      mutate(median = median(value_imp),
+             val_norm = value_imp / median) 
+  }))
+```
+
+# Annotation
+
+```{r}
+load("rdata/ionsdb_stds.RData")
+
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+
+pr <- MzRtParam(tolerance = 0.01, toleranceRt = 0.15) # define the parameters
+mt_ft <- matchValues(feat, ionsdb, param = pr, 
+                     rtColname = c("RT", "ion_rt"),
+                     mzColname = c("mz", "ion_mz"))
+mtft_df <- data.frame(matchedData(mt_ft))
+mtft_df <- mtft_df[!is.na(mtft_df$target_name),]
+
+mtft_df$mz <- round(mtft_df$mz, 4) #less decimals
+mtft_df$RT <- round(mtft_df$RT, 2)
+DT::datatable(mtft_df)
+```
+
+
+# PCA - data prior normalisation
+
+```{r plots, results='asis'}
+data_pca <- data_raw
+data_pca[data_pca == 0] <- NA #replace 0 with missing values to be able to input the data
+
+dt_i <- apply(data_pca, 2, myimputer) #impute
+dt_il <- log10(dt_i) #transform
+dt_ils <- apply(dt_il, 2, scaling.pareto) #scale, from hear one the selction of samples is also important, for example there is a difference between scaling only samples or everything
+pca <- prcomp(dt_ils, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+pca_l <- data.frame(pca$rotation)
+
+#pca with all samples, seperated by condition
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+#select only samples with time dependent condition and qc
+idx <- which(md$sample %in% c("Blank", "QC0D"))
+dt_ils2 <- apply(dt_il[idx,], 2, scaling.pareto) #continue from scaling with selected data
+pca2 <- prcomp(dt_ils2, center = FALSE, scale. = FALSE)
+pca_s2 <- data.frame(pca2$x)
+pca_l2 <- data.frame(pca2$rotation)
+#pca with selected samples, condition correlation 
+plot_ly(data = pca_s2, x = ~PC1, y = ~PC2, color = md$sample[idx],
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, time correlation 
+plot_ly(data = pca_s2, x = ~PC1, y = ~PC2, color = as.factor(md$time[idx]),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, donor correlation 
+plot_ly(data = pca_s2, x = ~PC1, y = ~PC2, color = as.factor(md$donor[idx]),
+        colors = "Set1",
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca2)$importance[2,2]*100), "%)"))
+  )
+
+```
+
+# PCA - data after normalisation
+```{r}
+data_pca_norm <- data_pqn
+data_pca_norm[data_pca_norm == 0] <- NA #replace 0 with missing values to be able to input the data
+
+dt_norm_i <- apply(data_pca_norm, 2, myimputer) #impute
+dt_norm_il <- log10(dt_norm_i) #transform
+dt_norm_ils <- apply(dt_norm_il, 2, scaling.pareto) #scale, from hear one the selction of samples is also important, for example there is a difference between scaling only samples or everything
+pca_norm <- prcomp(dt_norm_il, center = FALSE, scale. = FALSE)
+pca_norm_s <- data.frame(pca_norm$x)
+pca_norm_l <- data.frame(pca_norm$rotation)
+
+#pca with all samples, seperated by condition
+plot_ly(data = pca_norm_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_norm)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_norm)$importance[2,2]*100), "%)"))
+  )
+
+#select only samples with time dependent condition and qc
+dt_norm_ils2 <- apply(dt_norm_il[idx,], 2, scaling.pareto) #continue from scaling with selected data
+pca_norm_2 <- prcomp(dt_norm_ils2, center = FALSE, scale. = FALSE)
+pca_norm_s2 <- data.frame(pca_norm_2$x)
+pca_norm_l2 <- data.frame(pca_norm_2$rotation)
+#pca with selected samples, condition correlation 
+plot_ly(data = pca_norm_s2, x = ~PC1, y = ~PC2, color = md$sample[idx],
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, time correlation 
+plot_ly(data = pca_norm_s2, x = ~PC1, y = ~PC2, color = as.factor(md$time[idx]),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, donor correlation 
+plot_ly(data = pca_norm_s2, x = ~PC1, y = ~PC2, color = as.factor(md$donor[idx]),
+        colors = "Set1",
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_norm_2)$importance[2,2]*100), "%)"))
+  )
+
+```
+
+# PCA - data after normalisation - batch - mediana
+```{r}
+data_pca_normBatch <- data_norm_batch
+data_pca_normBatch[data_pca_normBatch == 0] <- NA
+
+dt_normBatch_i <- apply(data_pca_normBatch, 2, myimputer) #impute
+dt_normBatch_il <- log10(dt_normBatch_i) #transform
+dt_normBatch_ils <- apply(dt_normBatch_il, 2, scaling.pareto) #scale, from hear one the selction of samples is also important, for example there is a difference between scaling only samples or everything
+pca_normBatch <- prcomp(dt_normBatch_il, center = FALSE, scale. = FALSE)
+pca_normBatch_s <- data.frame(pca_normBatch$x)
+pca_normBatch_l <- data.frame(pca_normBatch$rotation)
+
+#pca with all samples, seperated by condition
+plot_ly(data = pca_normBatch_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_normBatch)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_normBatch)$importance[2,2]*100), "%)"))
+  )
+
+#select only samples with time dependent condition and qc
+dt_normBatch_ils2 <- apply(dt_normBatch_il[idx,], 2, scaling.pareto) #continue from scaling with selected data
+pca_normBatch_2 <- prcomp(dt_normBatch_ils2, center = FALSE, scale. = FALSE)
+pca_normBatch_s2 <- data.frame(pca_normBatch_2$x)
+pca_norm_l2 <- data.frame(pca_normBatch_2$rotation)
+#pca with selected samples, condition correlation 
+plot_ly(data = pca_normBatch_s2, x = ~PC1, y = ~PC2, color = md$sample[idx],
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, time correlation 
+plot_ly(data = pca_normBatch_s2, x = ~PC1, y = ~PC2, color = as.factor(md$time[idx]),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,2]*100), "%)"))
+  )
+
+#pca with selected samples, donor correlation 
+plot_ly(data = pca_normBatch_s2, x = ~PC1, y = ~PC2, color = as.factor(md$donor[idx]),
+        colors = "Set1",
+        text = md$filename[idx]) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca_normBatch_2)$importance[2,2]*100), "%)"))
+  )
+
+```
+
+
+# PCA - data after normalisation - mediana
+```{r}
+dtx <- dt_normMedian %>%
+  select(c("name", "data")) %>%
+  unnest("data") %>%
+  select(c("name", "filename", "val_norm")) %>%
+  pivot_wider(names_from = "name", values_from = "val_norm") %>%
+  column_to_rownames("filename")
+
+dtx_transf <- apply(dtx, 2, myimputer)
+dtx_transf <- log10(dtx_transf)
+dtx_transf <- apply(dtx_transf, 2, scaling.pareto)
+pca <- prcomp(dtx_transf, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+md <- dt$data[[1]]
+md <- md %>%
+  filter(inj_order >= 8)
+#pca with all samples
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+idx <- which(md$sample %in% c("Blank", "QC0D"))
+dtx <- dtx[idx,]
+md <- md[idx,]
+dtx_transf <- apply(dtx, 2, myimputer)
+dtx_transf <- log10(dtx_transf)
+dtx_transf <- apply(dtx_transf, 2, scaling.pareto)
+pca <- prcomp(dtx_transf, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = as.factor(md$time),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$donor,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+```
+
+# Session info
+
+```{r session-info}
+Sys.time()-startpoint
+devtools::session_info()
+```
+
+

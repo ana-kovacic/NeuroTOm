@@ -1,0 +1,311 @@
+---
+title: "02_Normalisation_median"
+author: "AnaK"
+date: "2024-06-18"
+output: html_document
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r libraries}
+p <- "POS"
+software <- "mzmine" 
+myfile <- "data/Fecal_pos_aligned_2e3.xlsx"
+
+library(tidyverse)
+library(effectsize)
+library(readxl)
+library(MetaboAnnotation)
+library(plotly)
+library(writexl)
+library(RColorBrewer)
+library(DT)
+
+library(MsCoreUtils)
+library(ggplot2)
+
+myimputer <- function(v){
+  set.seed(123)
+  if(sum(is.na(v)) == 0) {
+    return(v)
+  } else {
+    napos <- which(is.na(v))
+    newval <- runif(length(napos), 0, min(v, na.rm = TRUE))
+    out <- v
+    out[napos] <- newval
+    return(out)
+  }
+}
+
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+rsd <- function(x){(sd(x) / mean(x))*100}
+```
+
+# Data import
+
+```{r import}
+if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data_raw <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data_raw) <- paste0("FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+data_raw <- data.frame(t(data_raw)) #transform data
+```
+
+# MetaData Organisation
+```{r}
+#prepare the metadata of the sample names
+md <- gsub(".mzML Peak area", "", rownames(data_raw))
+idx <- grep("_QC_0D", md)
+md[idx] <- gsub("_QC_0D", "_QC0D", md[idx])
+rm(idx)
+
+md <- data.frame(do.call(rbind, strsplit(md, "_")))
+colnames(md) <- c("date", "inj_order", "scan", "acquisition", "polarity", "resolution", "donor", "sample", "time")# Name the columns if needed
+md$filename <- gsub(".mzML Peak area", "", rownames(data_raw))
+idx <- which(md$sample %in% c("QC", "QC0D", "Solvent", "stdMix", "Buffer")) #seperate samples from samples that are not fermentation time dependent 
+md$time[idx] <- 9999 #instead of time contains 9999, also names in the pca 
+md$time <- as.numeric(gsub("h", "", md$time)) #remove h from time, so that it is numeric and can be use for plots 
+rm(idx)
+md  <- md 
+md$inj_order <- as.numeric(str_replace(md$inj_order, "^0+" ,""))
+```
+
+#Data Organisation
+
+```{r}
+dt <- cbind(data_raw, md) %>% #bind the raw data with md
+  as_tibble() %>% #work with tidyverse, for htis case is better 
+  pivot_longer(colnames(data_raw)) %>% #pivot per colnames in order to combine data per feature with nest by name - each feature 
+  nest(data = !c("name")) %>%
+  mutate(data = map(data, function(t){ #with mutate function you generate a new colume aplying the function on the old one, maping in data per feature a new colume
+    t$val_na <- ifelse(t$value == 0, NA, t$value) #a new colume with replaced 0 with na
+    t$value_imp <- myimputer(t$val_na) # a new colume with imputed data
+    t$val_imp_log <- log10(t$value_imp) #a new colume with transformed data
+    t
+  }))
+
+feat2 <- rename(feat, name = FT) #rename the colume name in to have the same colume name for joing 
+dt <- dt %>%
+  left_join(feat2) #JOING TABLE TO HAVE MZ AND RT AS WELL
+rm(feat2)
+#load("rdata/dt.RData") #in case you just need to load the data 
+```
+
+# Normalisation - median = 1
+```{r}
+#filter data, remove the first injection, first relevant injection is the last of the first QC with injection order = 8  
+dt_normMedian <- dt %>%
+  mutate(data_original = data) %>% # the non filtered data 
+  mutate(data = map(data, function(t){ #filtered data
+    t %>%
+      filter(inj_order >= 8)
+  }))
+#normalization median of each feature = 1
+dt_normMedian <- dt_normMedian %>% 
+  mutate(data = map(data, function(t){
+    t <- t %>%
+      group_by(donor) %>%
+      mutate(median = median(value_imp),
+             val_norm = value_imp / median) 
+  }))
+#load("rdata/dt_normMedian")
+#save data
+save(dt_normMedian, file = "rdata/dt_normMedian.RData")
+```
+
+# Checking the normalisation output 
+```{r}
+idx_cb <- which(between(dt_normMedian$mz, 152.0577+ 0.01 *c(-1, 1)))
+ t <- dt_normMedian$data[[idx_cb]]
+ 
+# the normalized data per donor - the normalization formula, it should give 0
+# idx_cb <- which(t$donor == "D3")
+# t$val_norm[idx_cb] - (t$value_imp[idx_cb] / median(t$value_imp[idx_cb])) 
+
+  #we exclude also qc
+ t %>%
+   filter(sample %in% c("Aspartame", "BPS", "Blank", "Difenoconazole", 
+                        "Inulin", "PantothenicAcid", "Rutin", "Tomatine", 
+                        "Tomato1", "Tomato2", "Tomato3", "TomatoToxic")) %>%
+ ggplot(aes(x = time, y = val_norm, color = sample, group = paste(sample, donor))) +
+   geom_point() +
+   geom_line()
+ 
+ #comparison between normalized and not normalized time trend curve per compound
+ t %>%
+   filter(sample %in% c("Aspartame", "BPS", "Blank", "Difenoconazole", 
+                        "Inulin", "PantothenicAcid", "Rutin", "Tomatine", 
+                        "Tomato1", "Tomato2", "Tomato3", "TomatoToxic"))%>%
+   select(filename, sample, donor, time, val_norm, value_imp) %>%
+   pivot_longer(c(val_norm, value_imp)) %>%
+   mutate(name = factor(name, levels = c("value_imp", "val_norm"))) %>%
+   ggplot(aes(x = time, y = value, color = sample, group = paste(sample, donor))) +
+   geom_point() +
+   geom_line() + 
+theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+  ggtitle(paste(dt$name[idx_cb], "\n", dt$mz[idx_cb], "@", dt$RT[idx_cb])) +
+   facet_wrap(~name, scales = "free_y")
+# 
+# #only sample of interest
+# idy <- which(dt$name == "FT00072")
+# dt_all_normBatch$blank_aspartame[idy]
+# #ploting data per each condition all donors, maybe easier to see if there is a time dofference or not 
+#  dt$data[[idx]] %>%
+#   filter(sample %in% c("Blank", "Aspartame")) %>%
+#   arrange(donor, sample, time) %>%
+#  ggplot(aes(x = time, y = value, group = paste(donor, sample), col = sample)) +
+#   geom_point() + geom_line() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+# theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+#   xlab("time [h]")+
+#     ylab("intensity")+
+#   ggtitle(paste(dt$name[idx], "\n", dt$mz[idx], "@", dt$RT[idx])) 
+```
+
+# PCA normalised data
+```{r}
+dtx <- dt %>%
+  select(c("name", "data")) %>%
+  unnest("data") %>%
+  select(c("name", "filename", "val_norm")) %>%
+  pivot_wider(names_from = "name", values_from = "val_norm") %>%
+  column_to_rownames("filename")
+
+dtx_transf <- apply(dtx, 2, myimputer)
+dtx_transf <- log10(dtx_transf)
+dtx_transf <- apply(dtx_transf, 2, scaling.pareto)
+pca <- prcomp(dtx_transf, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+md <- dt$data[[1]]
+md <- md %>%
+  filter(inj_order >= 8)
+#pca with all samples
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+idx <- which(md$sample %in% c("Aspartame", "BPS", "Blank", "Difenoconazole", 
+                              "Inulin", "PantothenicAcid", "Rutin", "Tomatine", 
+                              "Tomato1", "Tomato2", "Tomato3", "TomatoToxic", "QC0D"))
+dtx <- dtx[idx,]
+md <- md[idx,]
+dtx_transf <- apply(dtx, 2, myimputer)
+dtx_transf <- log10(dtx_transf)
+dtx_transf <- apply(dtx_transf, 2, scaling.pareto)
+pca <- prcomp(dtx_transf, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = as.factor(md$time),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$donor,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+```
+
+# PCA - RAW DATA
+```{r}
+dtx_RAW <- dt %>%
+  select(c("name", "data")) %>%
+  unnest("data") %>%
+  select(c("name", "filename", "value_imp")) %>%
+  pivot_wider(names_from = "name", values_from = "value_imp") %>%
+  column_to_rownames("filename")
+
+dtx_transf_raw <- apply(dtx_RAW, 2, myimputer)
+dtx_transf_raw <- log10(dtx_transf_raw)
+dtx_transf_raw <- apply(dtx_transf_raw, 2, scaling.pareto)
+pca <- prcomp(dtx_transf_raw, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+md <- dt$data[[1]]
+md <- md %>%
+  filter(inj_order >= 8)
+#pca with all samples
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+idx <- which(md$sample %in% c("Aspartame", "BPS", "Blank", "Difenoconazole", 
+                              "Inulin", "PantothenicAcid", "Rutin", "Tomatine", 
+                              "Tomato1", "Tomato2", "Tomato3", "TomatoToxic", "QC0D"))
+dtx_RAW <- dtx_RAW[idx,]
+md <- md[idx,]
+dtx_transf_raw <- apply(dtx_RAW, 2, myimputer)
+dtx_transf_raw <- log10(dtx_transf_raw)
+dtx_transf_raw <- apply(dtx_transf_raw, 2, scaling.pareto)
+pca <- prcomp(dtx_transf_raw, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = as.factor(md$time),
+        colors = c(brewer.pal(6, "YlOrRd"), "grey"),
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$donor,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = md$sample,
+        text = md$filename) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+```
+
+
+

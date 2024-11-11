@@ -1,0 +1,532 @@
+---
+title: "massFeatures_fitration_effectSize"
+author: "AnaK"
+date: "2024-05-22"
+output: html_document
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r libraries}
+p <- "POS"
+software <- "mzmine" 
+myfile <- "data/Fecal_pos_aligned_2e3.xlsx"
+
+library(tidyverse)
+library(effectsize)
+library(readxl)
+library(MetaboAnnotation)
+library(plotly)
+library(writexl)
+library(RColorBrewer)
+library(DT)
+
+myimputer <- function(v){
+  set.seed(123)
+  if(sum(is.na(v)) == 0) {
+    return(v)
+  } else {
+    napos <- which(is.na(v))
+    newval <- runif(length(napos), 0, min(v, na.rm = TRUE))
+    out <- v
+    out[napos] <- newval
+    return(out)
+  }
+}
+
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+rsd <- function(x){(sd(x) / mean(x))*100}
+```
+
+# Data import
+
+```{r import}
+if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data_raw <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data_raw) <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+data_raw <- data.frame(t(data_raw)) #transform data
+```
+
+# Meta Data Organisation
+```{r}
+#prepare the metadata of the sample names
+md <- gsub(".mzML Peak area", "", rownames(data_raw))
+idx <- grep("_QC_0D", md)
+md[idx] <- gsub("_QC_0D", "_QC0D", md[idx])
+rm(idx)
+
+md <- data.frame(do.call(rbind, strsplit(md, "_")))
+colnames(md) <- c("date", "inj_order", "scan", "acquisition", "polarity", "resolution", "donor", "sample", "time")# Name the columns if needed
+md$filename <- gsub(".mzML Peak area", "", rownames(data_raw))
+idx <- which(md$sample %in% c("QC", "QC0D", "Solvent", "stdMix", "Buffer")) #seperate samples from samples that are not fermentation time dependent 
+md$time[idx] <- 9999 #instead of time contains 9999, also names in the pca 
+md$time <- as.numeric(gsub("h", "", md$time)) #remove h from time, so that it is numeric and can be use for plots 
+rm(idx)
+md  <- md 
+md$inj_order <- as.numeric(str_replace(md$inj_order, "^0+" ,""))
+```
+
+# Raw data
+```{r}
+if(all(md$filename == gsub(".mzML.*", "", rownames(data_raw)))){
+  
+} else {
+  print("Warning!! Check order of raws between md and data_raw!!!")
+}
+
+
+dt <- cbind(data_raw, md) %>% #bind the raw data with md
+  as_tibble() %>% #work with tidyverse, for htis case is better 
+  pivot_longer(colnames(data_raw)) %>% #pivot per colnames in order to combine data per feature with nest by name - each feature 
+  nest(data = !c("name"))%>%
+  mutate(data = map(data, function(t){ #with mutate function you generate a new colume aplying the function on the old one, maping in data per feature a new colume
+    t$val_na <- ifelse(t$value == 0, NA, t$value) #a new colume with replaced 0 with na
+    t$value_imp <- myimputer(t$val_na) # a new colume with imputed data
+    t$val_imp_log <- log10(t$value_imp) #a new colume with transformed data
+    t
+  }))
+
+# #save data
+# save(dt, file = "rdata/dt.RData")
+# 
+# #if already saves then load data
+ load("rdata/dt.RData")
+```
+
+# Normalisation - median 1 (batch normalisation)
+
+```{r}
+#filter data, remove the first injection, first relevant injection is the last of the first QC with injection order = 8  
+dt_normMedian <- dt %>%
+  mutate(data_original = data) %>% # the non filtered data 
+  mutate(data = map(data, function(t){ #filtered data
+    t %>%
+      filter(inj_order >= 8)
+  }))
+#normalization median of each feature = 1
+dt_normMedian <- dt_normMedian %>% 
+  mutate(data = map(data, function(t){
+    t <- t %>%
+      group_by(donor) %>%
+      mutate(median = median(value_imp),
+             val_norm = value_imp / median) 
+  }))
+load("rdata/dt_normMedian.RData")
+#save data
+#save(dt_normMedian, file = "rdata/dt_normMedian.RData")
+```
+
+# Annotation
+## Annotation stds
+```{r}
+load("rdata/ionsdb_stds.RData")
+
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+
+pr <- MzRtParam(tolerance = 0.01, toleranceRt = 0.15) # define the parameters
+mt_ft <- matchValues(feat, ionsdb, param = pr, 
+                     rtColname = c("RT", "ion_rt"),
+                     mzColname = c("mz", "ion_mz"))
+mtft_df <- data.frame(matchedData(mt_ft))
+mtft_df <- mtft_df[!is.na(mtft_df$target_name),]
+
+mtft_df$mz <- round(mtft_df$mz, 4) #less decimals
+mtft_df$RT <- round(mtft_df$RT, 2)
+DT::datatable(mtft_df)
+```
+
+## Annotation metabol pathway
+```{r}
+load("rdata/ionsdb_Metabol_pathway.RData")
+
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+
+pr <- MzParam(tolerance = 0.01) # define the parameters
+mt_ft_MP <- matchValues(feat, ionsdb, param = pr, 
+                     mzColname = c("mz", "ion_mz"))
+mtft_df_MP <- data.frame(matchedData(mt_ft_MP))
+mtft_df_MP <- mtft_df_MP[!is.na(mtft_df_MP$target_name),]
+mtft_df_MP$mz <- round(mtft_df_MP$mz, 4) #less decimals
+mtft_df_MP$RT <- round(mtft_df_MP$RT, 2)
+DT::datatable(mtft_df_MP)
+```
+
+## Annotation Suspect list
+
+```{r annotation-sl}
+load("rdata/ionsdb_SL.RData")
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+
+pr <- MzParam(tolerance = 0.01) # define the parameters
+mt_ft_sl <- matchValues(feat, ionsdb, param = pr, 
+                     mzColname = c("mz", "ion_mz"))
+mtft_df_sl <- data.frame(matchedData(mt_ft_sl))
+mtft_df_sl <- mtft_df_sl[!is.na(mtft_df_sl$target_name),]
+mtft_df_sl$mz <- round(mtft_df_sl$mz, 4) #less decimals
+mtft_df_sl$RT <- round(mtft_df_sl$RT, 2)
+DT::datatable(mtft_df_sl)
+```
+
+# Pairwise comparision - effect size
+
+## Target compounds - ions db 
+```{r message=FALSE}
+mtft_df$name <- mtft_df$FT
+ 
+ dt_target <- dt %>%
+   select(name, data)
+ 
+
+ dt_target <- dt_target %>%
+  left_join(mtft_df)
+
+
+dt_target <- dt_target[!is.na(dt_target$target_name),]# dt2 is a selection of target compounds, the code otherwise needs some time
+
+#select data based on the condition you want to check
+dt_target <- dt_target %>%
+  mutate(blank_tomato = map(data, function(t){ #make a new colume maping within data that will contain statistical data named - by the filtered condition and apply the function t
+    t %>%
+      filter(sample %in% c("Blank", "Tomato1")) %>% #take only the data of interest - control and treatment
+      select(c("sample", "val_imp_log", "donor", "time")) %>% #select columes with data you need
+      pivot_wider(names_from = sample, values_from = val_imp_log) %>% #pivot the table with sample name as columes and data as rows per selected feature
+      group_by(time) %>% #since samples of the same time are dependent we group them by time, to prepare the data for ef and p value of dependent data - paired!
+      summarise(ES = cohens_d(Blank, Tomato1, paired = TRUE)$Cohens_d, #a colume with es per time
+                pval = t.test(Blank, Tomato1, paired = TRUE)$p.value)#a colume with p value per time
+  }))
+
+
+dt_target <- dt_target %>%
+  mutate(blank_tomato = map(blank_tomato, function(t){
+    t %>%
+      mutate(
+        condition = abs(ES) > 1 & pval, # ps more than abs 1, p value less the 0.05
+        consecutive_condition = condition & lag(condition, default = NA) #the both conditions must be fulfill by two consequitive time points, true otherwise false, NA if not consequitive, which for time zero can't be, thus giving NA in case it is true
+      ) %>%
+      mutate(
+        consecutive_condition2 = ifelse(time == 0, condition, consecutive_condition) #if NA, than put true, otherwise it is false for zero anyway 
+      )
+  }))
+
+#both conditions must be true at least within two consequent time points 
+dt_target_conseq <- dt_target %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+ any(!is.na(t$consecutive_condition) & t$consecutive_condition)
+ }))
+
+#at least one time with both conditions is true, if two much we can say one or at least two consequitive 
+dt_target_OneTime <- dt_target %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+    any(t$condition == TRUE)  # Only consider TRUE values, at least one row is true
+  }))
+ 
+#select relevant mass features
+ MassFeatures_rawDara_target_oneTime=dt_target_OneTime[dt_target_OneTime$blank_tomato_relevant==TRUE,]
+ MassFeatures_rawDara_target_conseqTime=dt_target_conseq[dt_target_conseq$blank_tomato_relevant==TRUE,]
+
+ #write data
+ write_csv(MassFeatures_rawDara_target_conseqTime, paste0(p, "MassFeatures_rawDara_target_conseqTime.csv"))
+write_csv(MassFeatures_rawDara_target_oneTime, paste0(p, " MassFeatures_rawDara_target_oneTime.csv"))
+save(dt_target, file = "rdata/dt_target_raw.RData")
+load("rdata/dt_target_raw.RData")
+
+#good to check if the code is doing correct stuff with some manual calculation
+#mean1 <- mean(u$Blank)
+#mean2 <- mean(u$Aspartame)
+#sddif <- sd(u$Blank - u$Aspartame)
+#(mean1 - mean2) / sddif
+```
+
+## Normalised data - target features 
+```{r}
+mtft_df$name <- mtft_df$FT
+ 
+ dt_normMedian_target <-  dt_normMedian %>%
+   select(name, data)
+ 
+
+ dt_normMedian_target <- dt_normMedian_target %>%
+  left_join(mtft_df)
+
+dt_normMedian_target <- dt_normMedian_target[!is.na(dt_normMedian_target$target_name),]# dt2 is a selection of target compounds, the code otherwise needs some time
+
+#select data based on the condition you want to check
+dt_normMedian_target <- dt_normMedian_target %>%
+  mutate(blank_tomato = map(data, function(t){ #make a new colume maping within data that will contain statistical data named - by the filtered condition and apply the function t
+    t %>%
+      filter(sample %in% c("Blank", "Tomato1")) %>% #take only the data of interest - control and treatment
+      select(c("sample", "val_norm", "donor", "time")) %>% #select columes with data you need
+      pivot_wider(names_from = sample, values_from = val_norm) %>% #pivot the table with sample name as columes and data as rows per selected feature
+      group_by(time) %>% #since samples of the same time are dependent we group them by time, to prepare the data for ef and p value of dependent data - paired!
+      summarise(ES = cohens_d(Blank, Tomato1, paired = TRUE)$Cohens_d, #a colume with es per time
+                pval = t.test(Blank, Tomato1, paired = TRUE)$p.value)#a colume with p value per time
+  }))
+
+
+dt_normMedian_target <- dt_normMedian_target %>%
+  mutate(blank_tomato = map(blank_tomato, function(t){
+    t %>%
+      mutate(
+        condition = abs(ES) > 1 & pval, # ps more than abs 1, p value less the 0.05
+        consecutive_condition = condition & lag(condition, default = NA) #the both conditions must be fulfill by two consequitive time points, true otherwise false, NA if not consequitive, which for time zero can't be, thus giving NA in case it is true
+      ) %>%
+      mutate(
+        consecutive_condition2 = ifelse(time == 0, condition, consecutive_condition) #if NA, than put true, otherwise it is false for zero anyway 
+      )
+  }))
+
+#both conditions must be true at least within two consequent time points 
+dt_normMedian_target_conseq <- dt_normMedian_target %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+ any(!is.na(t$consecutive_condition) & t$consecutive_condition)
+ }))
+
+#at least one time with both conditions is true, if two much we can say one or at least two consequitive 
+dt_normMedian_target_OneTime <- dt_normMedian_target %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+    any(t$condition == TRUE)  # Only consider TRUE values, at least one row is true
+  }))
+ 
+#select relevant mass features
+ MassFeatures_normDara_target_oneTime=dt_normMedian_target_OneTime[dt_normMedian_target_OneTime$blank_tomato_relevant==TRUE,]
+ MassFeatures_normDara_target_conseqTime=dt_normMedian_target_conseq[dt_normMedian_target_conseq$blank_tomato_relevant==TRUE,]
+
+ #write data
+ write_csv(MassFeatures_rawDara_target_conseqTime, paste0(p, "MassFeatures_rawDara_target_conseqTime.csv"))
+write_csv(MassFeatures_rawDara_target_oneTime, paste0(p, " MassFeatures_rawDara_target_oneTime.csv"))
+save(dt_normMedian_target, file = "rdata/dt_target_norm.RData")
+load("rdata/dt_neg_normMedian_target_inulin.RData")
+```
+
+### some plots of compunds to check
+```{r}
+#make some curves with selected data in order to see if the statsitical model is selecting relevant mass features, check them with order softwares if they are reall fetaures
+
+idx <- which(dt_neg_normMedian_all_inulin$name == "FT00409")
+
+dt_neg_normMedian_all_inulin$inulin_tomato[idx]
+
+#dt_normMedian_target data for each conditions, per each donor 
+dt_neg_normMedian_all_inulin$data[[idx]] %>%
+  filter(sample %in% c("Blank", "Tomato1", "Inulin")) %>%
+  arrange(donor, sample, time) %>%
+ ggplot(aes(x = time, y = val_norm, group = donor, col = donor)) +
+  geom_point() + geom_line() + scale_y_log10() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+  facet_wrap(~sample) +
+  theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+ ggtitle(paste(dt_neg_normMedian_all_inulin$name[idx], "\n", round(dt_neg_normMedian_all_inulin$mz[idx], 6), "@", round(dt_neg_normMedian_all_inulin$RT[idx], 2))) 
+
+#ploting data per each condition all donors, maybe easier to see if there is a time dofference or not 
+ dt_normMedian_target$data[[idx]] %>%
+  filter(sample %in% c("Blank", "Tomato1","Inulin")) %>%
+  arrange(donor, sample, time) %>%
+ ggplot(aes(x = time, y = value_imp, group = paste(donor, sample), col = sample)) +
+  geom_point() + geom_line() + scale_y_log10() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+  ggtitle(paste(dt_normMedian_target$name[idx], "\n", dt_normMedian_target$mz[idx], "@", dt_normMedian_target$RT[idx])) 
+```
+
+
+## All - raw data
+```{r message=FALSE}
+# mtft_df_sl$name <- mtft_df_sl$FT
+#  
+#  dt_all <-  dt %>%
+#    select(name, data)
+#  
+# 
+#  dt_all <- dt_all %>%
+#   left_join(mtft_df_sl)
+# 
+# #matching with suspect list
+# dt_normMedian_all <- dt_normMedian_all %>%
+#   left_join(mtft_df_sl %>% select(name, target_name, ppm_error), by = 'name')
+
+dt_all <- dt %>%
+  mutate(blank_tomato = map(data, function(t){ #make a new colume maping within data that will contain statistical data named - by the filtered condition and apply the function t
+    t %>%
+      filter(sample %in% c("Blank", "Tomato1")) %>% #take only the data of interest - control and treatment
+      select(c("sample", "val_imp_log", "donor", "time")) %>% #select columes with data you need
+      pivot_wider(names_from = sample, values_from = val_imp_log) %>% #pivot the table with sample name as columes and data as rows per selected feature
+      group_by(time) %>% #since samples of the same time are dependent we group them by time, to prepare the data for ef and p value of dependent data - paired!
+      summarise(ES = cohens_d(Blank, Tomato1, paired = TRUE)$Cohens_d, #a colume with es per time
+                pval = t.test(Blank, Tomato1, paired = TRUE)$p.value)#a colume with p value per time
+  }))
+
+
+dt_all <- dt_all %>%
+  mutate(blank_tomato = map(blank_tomato, function(t){
+    t %>%
+      mutate(
+        condition = abs(ES) > 1 & pval < 0.05, # ps more than abs 1, p value less the 0.05
+        consecutive_condition = condition & lag(condition, default = NA) #the both conditions must be fulfill by two consequitive time points, true otherwise false, NA if not consequitive, which for time zero can't be, thus giving NA in case it is true
+      ) %>%
+      mutate(
+        consecutive_condition2 = ifelse(time == 0, condition, consecutive_condition) #if NA, than put true, otherwise it is false for zero anyway 
+      )
+  }))
+
+
+#at least one time with both conditions is true, if two much we can say one or at least two consequitive 
+dt_all_oneTrue <- dt_all %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+    any(t$condition == TRUE)  # Only consider TRUE values, at least one row is true
+  }))
+
+#both conditions must be true at least within two consequent time points 
+dt_all_conseq <- dt_all %>%
+  mutate(blank_tomato_relevant = map_lgl(blank_tomato, function(t){
+ any(!is.na(t$consecutive_condition) & t$consecutive_condition)
+ }))
+
+#select relevant data and save
+ MassFeatures_rawData_all_conseqTime=dt_all_conseq[dt_all_conseq$blank_tomato_relevant==TRUE,]
+ MassFeatures_rawData_target_oneTime=dt_all_oneTrue[dt_all_oneTrue$blank_tomato_relevant==TRUE,]
+
+write_csv( MassFeatures_rawData_all_conseqTime, paste0(p, "_MassFeatures_rawData_all_conseqTime.csv"))
+write_csv(MassFeatures_rawData_target_oneTime, paste0(p, "_MassFeatures_rawData_all_oneTime.csv"))
+save(dt_all, file = "rdata/dt_all_raw.RData")
+```
+
+
+## Normalised data - all - Median Batch 
+```{r message=FALSE}
+
+#select data based on the condition you want to check
+dt_normMedian_all_inulin <- dt_normMedian %>%
+  mutate(inulin_tomato = map(data, function(t){ #make a new colume maping within data that will contain statistical data named - by the filtered condition and apply the function t
+    t %>%
+      filter(sample %in% c("Inulin", "Tomato1")) %>% #take only the data of interest - control and treatment
+      select(c("sample", "val_norm", "donor", "time")) %>% #select columes with data you need
+      pivot_wider(names_from = sample, values_from = val_norm) %>% #pivot the table with sample name as columes and data as rows per selected feature
+      group_by(time) %>% #since samples of the same time are dependent we group them by time, to prepare the data for ef and p value of dependent data - paired!
+      summarise(ES = cohens_d(Inulin, Tomato1, paired = TRUE)$Cohens_d, #a colume with es per time
+                pval = t.test(Inulin, Tomato1, paired = TRUE)$p.value)#a colume with p value per time
+  }))
+
+dt_normMedian_all_inulin <- dt_normMedian_all_inulin %>%
+  mutate(inulin_tomato = map(inulin_tomato, function(t){
+    t %>%
+      mutate(
+        condition = abs(ES) > 1 & pval, # ps more than abs 1, p value less the 0.05
+        consecutive_condition = condition & lag(condition, default = NA) #the both conditions must be fulfill by two consequitive time points, true otherwise false, NA if not consequitive, which for time zero can't be, thus giving NA in case it is true
+      ) %>%
+      mutate(
+        consecutive_condition2 = ifelse(time == 0, condition, consecutive_condition) #if NA, than put true, otherwise it is false for zero anyway 
+      )
+  }))
+save(dt_normMedian_all_inulin, file = "rdata/dt_normMedian_all_inulin.RData")
+
+#both conditions must be true at least within two consequent time points 
+dt_normMedian_all_inulin_conseq <- dt_normMedian_all_inulin %>%
+  mutate(inulin_tomato_relevant = map_lgl(inulin_tomato, function(t){
+ any(!is.na(t$consecutive_condition) & t$consecutive_condition)
+ }))
+#both conditions must be true for all time points
+dt_normMedian_all_inulin_conseqALL <-  dt_normMedian_all_inulin %>%
+  mutate(inulin_tomato_relevant = map_lgl(inulin_tomato, function(t){
+    all(t$consecutive_condition2)
+  }))
+
+#at least one time with both conditions is true, if two much we can say one or at least two consequitive 
+dt_normMedian_all_inulin_OneTime <- dt_normMedian_all_inulin %>%
+  mutate(inulin_tomato_relevant = map_lgl(inulin_tomato, function(t){
+    any(t$condition == TRUE)  # Only consider TRUE values, at least one row is true
+  }))
+ 
+#select relevant mass features
+ MassFeatures_normData_all_inluin_oneTime=dt_normMedian_all_inulin_OneTime[dt_normMedian_all_inulin_OneTime$inulin_tomato_relevant==TRUE,]
+ MassFeatures_normData_all_inluin_conseqTime=dt_normMedian_all_inulin_conseq[dt_normMedian_all_inulin_conseq$inulin_tomato_relevant==TRUE,]
+ MassFeatures_normData_all_inluin_ALLTime=dt_normMedian_all_inulin_conseqALL[dt_normMedian_all_inulin_conseqALL$inulin_tomato_relevant==TRUE,]
+
+ #write data
+ write_csv(MassFeatures_normData_all_inluin_conseqTime, paste0(p, "_RelevantMassFeatures_normData_tomato_inulin_2conseqTime.csv"))
+write_csv(MassFeatures_normData_all_inluin_ALLTime, paste0(p, " _RelevantMassFeatures_normData_tomato_inulin_ALLconseqTime.csv"))
+write_csv(MassFeatures_normData_all_inluin_oneTime, paste0(p, " _RelevantMassFeatures_normData_tomato_inulin_oneTime.csv"))
+
+save(dt_normMedian_all, file = "rdata/dt_all_norm.RData")
+load("rdata/dt_neg_normMedian_all_inulin.RData")
+```
+
+### some plots of kinetics 
+```{r}
+#make some curves with selected data in order to see if the statsitical model is selecting relevant mass features, check them with order softwares if they are reall fetaures
+
+idx <- which(dt_normMedian_all_inulin$name == "FT00060")
+
+dt_normMedian_all_inulin$inulin_tomato[idx]
+
+#ploted data for each conditions, per each donor 
+dt_normMedian_all_inulin$data[[idx]] %>%
+  filter(sample %in% c("Inulin", "Tomato1")) %>%
+  arrange(donor, sample, time) %>%
+ ggplot(aes(x = time, y = value_imp, group = donor, col = donor)) +
+  geom_point() + geom_line() + scale_y_log10() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+  facet_wrap(~sample) +
+  theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+ ggtitle(paste(dt_normMedian_all_inulin$name[idx], "\n", round(dt_normMedian_all_inulin$mz[idx], 6), "@", round(dt_normMedian_all_inulin$RT[idx], 2))) 
+
+#ploting data per each condition all donors, maybe easier to see if there is a time dofference or not 
+ dt_normMedian_all_inulin$data[[idx]] %>%
+  filter(sample %in% c("Inulin", "Tomato1")) %>%
+  arrange(donor, sample, time) %>%
+ ggplot(aes(x = time, y = value_imp, group = paste(donor, sample), col = sample)) +
+  geom_point() + geom_line() + scale_y_log10() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+  ggtitle(paste(dt_normMedian_all_inulin$name[idx], "\n", dt_normMedian_all_inulin$mz[idx], "@", dt_normMedian_all_inulin$RT[idx])) 
+ 
+ idx <- which(dt_normMedian_all_inulin$name == "FT08247")
+dt_normMedian_all_inulin$inulin_tomato[idx]
+#ploted data for each conditions, per each donor 
+dt_normMedian_all$data[[idx]] %>%
+  filter(sample %in% c("Inulin", "Tomato1")) %>%
+  arrange(donor, sample, time) %>%
+ ggplot(aes(x = time, y = value_imp, group = donor, col = donor)) +
+  geom_point() + geom_line() + scale_y_log10() + scale_x_continuous(breaks = c(0, 3,6,9,12,24)) +
+  facet_wrap(~sample) +
+  theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+  xlab("time [h]")+
+    ylab("intensity")+
+ ggtitle(paste(dt_normMedian_all_inulin$name[idx], "\n", round(dt_normMedian_all_inulin$mz[idx], 6), "@", round(dt_normMedian_all_inulin$RT[idx], 2))) 
+```
+
+# Session info
+
+```{r session-info}
+Sys.time()-startpoint
+devtools::session_info()
+```
