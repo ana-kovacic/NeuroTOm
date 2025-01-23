@@ -1,0 +1,98 @@
+---
+title: "Data workflow"
+author: "Mar Garcia-Aloy"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    toc: false
+    number_sections: false
+    toc_float: false
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+In this document we do the workflow of feature selection to identify interesting compounds.  
+From original dataset from Progenesis and processed by AK we select the good quality features.   
+Then we match their mz values with the mz of suspect list (considering only [M+H]+) and then we keep those features that matched with at least 1 suspect mz value.  
+  
+**Result:** 
+  POSITIVE MODE
+  - from 20.915 features --> 17.207 good quality features  
+  - from 17.207 features --> 2.825 m/z matching with suspect list   
+  - from  2.825 features --> 58 annotated compounds   
+
+```{r}
+library(tidyverse)
+library(MetaboCoreUtils)
+library(MetaboAnnotation)
+library(effectsize)
+
+# Suspect list import and m/z calculation:
+slist <- read.csv("data/SuspectList_3rd_200223.csv")
+slist$mass <- calculateMass(slist$formula)
+idx <- which(is.na(slist$mass))
+if(length(idx) > 0){
+  slist <- slist[-idx,]
+}
+slist$mz <- as.numeric(mass2mz(slist$mass, "[M+H]+"))
+
+
+# Study data import (processed by AK):
+load("data/mydat_neg.RData")
+nrow(mydat)
+table(mydat$noise) # from 20.915 features --> 17.207 good quality features
+
+# Match study features with suspect list m/z:
+feats <- mydat %>%
+  filter(noise == FALSE) %>%
+  select(name, mz)
+mymatchs <- matchValues(data.frame(feats),
+                        data.frame(slist[,c("name", "mz", "activity")]), 
+                        param = MzParam(tolerance = 0.01))
+mymatchdt <- data.frame(matchedData(mymatchs))
+
+mymatchdt <- mymatchdt %>%
+  as_tibble() %>%
+  filter(!is.na(target_name)) %>%
+  nest(suspect = !c(name, mz))
+
+mymatchdt <- mymatchdt %>%
+  mutate(suspect_n = map_dbl(suspect, function(t) nrow(t)))
+
+mydat <- mydat %>%
+  left_join(mymatchdt %>% select(!mz))
+rm(slist, mymatchs, mymatchdt, feats, idx)
+
+mydat <- mydat %>%
+  filter(noise == FALSE & !is.na(suspect_n))
+nrow(mydat) # from 17.207 good quality features --> 2.825 m/z matching with suspect list
+
+# Get maximum mean(group):
+mydat <- mydat %>%
+  mutate(data = map(data, function(t){
+    t %>%
+      mutate(norm_indiv_0 = ifelse(is.na(norm_indiv), 0, norm_indiv)) %>%
+      separate(id, sep = "_", into = c("order", "sample", "rep1", "rep2"), remove = FALSE) %>%
+      mutate(group = gsub(paste(seq(6), collapse = "|"), "", sample))
+  })) %>%
+  mutate(mean_group = map(data, function(t){
+    t %>% 
+      group_by(group) %>% 
+      summarise(mean_log  = mean(norm_indiv_i))
+  })) %>%
+  mutate(mean_max = map_dbl(mean_group, function(t){
+    t %>%
+      filter(group %in% c("D", "DO", "PF", "PS")) %>%
+      pull(mean_log) %>%
+      max(.)
+  }))
+```
+
+# Session information
+```{r session}
+Sys.time()-startpoint
+devtools::session_info()
+```

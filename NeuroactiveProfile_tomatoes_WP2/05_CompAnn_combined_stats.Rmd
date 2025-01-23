@@ -1,0 +1,483 @@
+---
+title: "Annotated comppounds_statistics"
+author: "Ana Kovacic"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    toc: false
+    number_sections: false
+    toc_float: false
+---
+
+```{r startpoint, include = FALSE}
+startpoint <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+In this document we first combine all annotated compunds processed ander 04_CompAnn_stats and later perform tha statistics and visualisation on the annotated compunds only instead of on the whole dataset. 
+**Result:** 
+ - we have annotated 78 compounds, but 5 of them are lost, however they were already a little bit questionable, no drama if we skip them
+ - 71 compunds were annotated and also are present in the final table
+ - from this 71 compounds, 3 are found as noise, but they will still be included because they are found as noise due to negative ratio, but they seem to be ok 
+ **done:**
+ - perform pairwaise comparision to define the markers for study condition
+ - using van diagram show how many of them are markers
+ - heatmap to present graphically results, seperate by activity, group and marker specification 
+ 
+# Libraires
+
+```{r}
+library(writexl)
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(MetaboAnnotation)
+library(effectsize)
+library(DT)
+library(kableExtra)
+library(vegan)
+library(devtools)
+library(reshape2)
+library(VennDiagram)
+library(grid)
+library(officer) 
+
+
+scaling.pareto <- function(x){(x - mean(x)) / sqrt(sd(x))}
+```
+
+# Import data 
+```{r}
+# Study data import (annotated compounds combine both polarities):
+load("output/mydat_neg.RData")
+mydat_neg <- mydat
+load("output/mydat_pos.RData")
+mydat_pos <- mydat
+rm(mydat)
+
+mydat_neg_CompAnn <- mydat_neg %>%
+  filter(!is.na(target_name))
+
+mydat_neg_CompAnn_filtered <- mydat_neg_CompAnn %>%
+  filter(str_detect(target_mode, "\\-"))
+
+mydat_pos_CompAnn <- mydat_pos %>%
+  filter(!is.na(target_name))
+
+mydat_pos_CompAnn_filtered <- mydat_pos_CompAnn %>%
+  filter(str_detect(target_mode, "\\+"))
+
+combined_df <- bind_rows(mydat_pos_CompAnn_filtered, mydat_neg_CompAnn_filtered)
+combined_all <- bind_rows(mydat_pos_CompAnn, mydat_neg_CompAnn)
+
+## use when checking what is combined and what not
+# any(combined_all$target_name %in% ionsdb$name)
+# 
+# load("rdata/ionsdb_AnnComp.RData")
+# missing_in_combined_df <- setdiff(ionsdb$name, combined_df$target_name)
+# print(missing_in_combined_df)
+# 
+# missing_in_combined_all <- setdiff(ionsdb$name, combined_all$target_name)
+# print(missing_in_combined_all) #check which compounds have you lost: "4-Aminobenzoic acid" "Aspartame", "p-Coumaric acid", "Caffeic aldehyde", "Tomatine (II)"      still, check way, for some rt bad
+
+#remove no need data
+rm(combined_all, mydat_neg, mydat_neg_CompAnn_filtered, mydat_pos, mydat_pos_CompAnn, mydat_pos_CompAnn_filtered, mydat_neg_CompAnn)
+#save data
+write_xlsx(combined_df, file = "output/AnnComp_data.xlsx")
+save(combined_df, file = "output/AnnComp_data.RData")
+```
+
+# Statistical analysis
+```{r}
+# Get maximum mean(group):
+combined_df <- combined_df %>%
+  mutate(data2 = map(data, function(t){
+    t$exclude <- grepl("P_|QC|PPB", t$id) # exclude blanks, pooled samples and qc
+    t <- t %>%
+      filter(!t$exclude)
+    t
+  }))
+
+mydat_annComp <- combined_df %>%
+  mutate(data2 = map(data2, function(t){
+    t$class <- gsub('[[:digit:]]+', '', t$id)
+    t$class <- gsub("_", "", t$class)
+       t
+  }))
+
+
+# Get maximum mean(group):
+mydat_annComp <- mydat_annComp %>%
+  mutate(mean_group = map(data2, function(t) {
+    t %>%
+      group_by(class) %>%
+      summarise(mean_log = mean(norm_indiv_i), .groups = 'drop')
+  })) %>%
+  
+  # Get maximum mean for each group
+  mutate(mean_max = map_dbl(mean_group, function(t) {
+    t %>%
+      pull(mean_log) %>%
+      max()  # Get the maximum mean
+  })) %>%
+  mutate(mean_max = map_dbl(mean_group, function(t){
+    t %>%
+    # filter(class %in% c("D", "DO", "PF", "PS")) %>%
+      pull(mean_log) %>%
+      max(.)
+  }))%>%
+  mutate(mean_max_class = map_chr(mean_group, function(t){
+    t %>%
+      filter(mean_log == max(mean_log)) %>%   # Filter for the class with the max mean_log
+      pull(class)  # Return the corresponding class name
+  }))  %>%
+  # Get the second highest mean for each group
+  mutate(mean_second_max = map_dbl(mean_group, function(t) {
+    t %>%
+      pull(mean_log) %>%
+      sort(decreasing = TRUE) %>%  # Sort in descending order
+      .[2]  # Select the second value (second highest)
+  })) %>%
+
+  # Get the class corresponding to the second highest mean
+  mutate(mean_second_max_class = map_chr(mean_group, function(t) {
+    second_max <- t %>%
+      pull(mean_log) %>%
+      sort(decreasing = TRUE) %>%
+      .[2]  # Get the second highest mean
+
+    # Return the class associated with the second highest mean
+    t %>%
+      filter(mean_log == second_max) %>%
+      pull(class)
+  }))
+
+```
+
+## PCA AnnoComp
+```{r}
+# PCA with annotated compounds and samples only
+data <- mydat_annComp %>%
+    select(c("name", "data2"))  %>%
+  unnest(data2) %>%
+  select(c("name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "name", values_from = "norm_indiv_i") %>%
+  column_to_rownames("id")
+
+data <- apply(data, 2, scaling.pareto)
+
+pca <- prcomp(data, center = FALSE, scale. = FALSE)
+pca_s <- data.frame(pca$x)
+
+s_class <- gsub('[[:digit:]]+', '', rownames(data)) #exlude numbers from the names, we had to do it like that because i made some errors in sample names
+s_class <- gsub("_", "", s_class)
+
+plot_ly(data = pca_s, x = ~PC1, y = ~PC2, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC1 (", sprintf("%.1f", summary(pca)$importance[2,1]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC2 (", sprintf("%.1f", summary(pca)$importance[2,2]*100), "%)"))
+  )
+
+plot_ly(data = pca_s, x = ~PC3, y = ~PC4, color = s_class, colors = "Set2", size = 2,
+        text = rownames(data)) %>%
+  layout(title = "Score plot",
+         xaxis = list(title = paste0(
+           "PC3 (", sprintf("%.1f", summary(pca)$importance[2,3]*100), "%)")),
+         yaxis = list(title = paste0(
+           "PC4 (", sprintf("%.1f", summary(pca)$importance[2,4]*100), "%)"))
+  )
+```
+
+## Pairwise comparision
+```{r}
+# Relevance (based on t-test + effect size):
+mydat_annComp <- mydat_annComp %>%
+  mutate(organic_pval = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("D", "DO"))
+    t.test(norm_indiv_i ~ class, data = u)$p.value
+  })) %>%
+  mutate(organic_cd = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("D", "DO"))
+    cohens_d(norm_indiv_i ~ class, data = u)$Cohens_d
+  })) %>%
+  mutate(variety_pval = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("D", "PF"))
+    t.test(norm_indiv_i ~ class, data = u)$p.value
+  })) %>%
+  mutate(variety_cd = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("D", "PF"))
+    cohens_d(norm_indiv_i ~ class, data = u)$Cohens_d
+  })) %>% 
+  mutate(procss_pval = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("PF", "PS"))
+    t.test(norm_indiv_i ~ class, data = u)$p.value
+  })) %>%
+  mutate(procss_cd = map_dbl(data2, function(t){
+    u <- t %>%
+      filter(class %in% c("PF", "PS"))
+    cohens_d(norm_indiv_i ~ class, data = u)$Cohens_d
+  }))
+
+# indicate if each feature was marker of organic-variety-process or never relevant 
+# according to the "new statistics":
+mydat_annComp <- mydat_annComp %>%
+  mutate(marker_organic = organic_pval < 0.05 & abs(organic_cd) > 1) %>%
+  mutate(marker_variety = variety_pval < 0.05 & abs(variety_cd) > 1) %>%
+  mutate(marker_procss = procss_pval < 0.05 & abs(procss_cd) > 1) %>%
+  mutate(not_marker = (variety_pval > 0.05 | abs(variety_cd) < 1) &
+           (procss_pval > 0.05 | abs(procss_cd) < 1) &
+           (organic_pval > 0.05 | abs(organic_cd) < 1))
+
+# get the names of markers and not-markers:
+mk_organic <- mydat_annComp %>%
+  filter(marker_organic) %>%
+  arrange(-mean_max) %>%
+  pull(name)
+
+mk_variety <- mydat_annComp %>%
+  filter(marker_variety) %>%
+  arrange(-mean_max) %>%
+  pull(name)
+
+mk_procss <- mydat_annComp %>%
+  filter(marker_procss) %>%
+  arrange(-mean_max) %>%
+  pull(name)
+
+mk_NOT <- mydat_annComp %>%
+  filter(not_marker) %>%
+  arrange(-mean_max) %>%
+  pull(name)
+
+save(mydat_annComp, file = "output/AnnComp_stat_MK.RData")
+save(combined_df, file = "output/Acombined_df.RData")
+
+write_xlsx(mydat_annComp, path = paste0("output/mydat_annComp_stat_MK.xlsx")) #write excel file with normalized intensity of annotated compounds
+```
+
+## Plots
+### van diagrams
+```{r}
+# see if markers were common for >1 criteria or not:
+png(filename = "venn_diagram.png", width = 1200, height = 800, res = 100)
+venn.plot <- venn.diagram(
+  x = list(organic = mk_organic, variety = mk_variety, process = mk_procss, not = mk_NOT),
+  category.names = c("Organic", "Variety", "Process", "Not marker"),
+  filename = NULL, # Set to NULL to render the plot in the R graphics device
+  output = TRUE,
+    cex = 2,  # Adjust the text size (increase for larger text)
+  cat.cex = 3 # Optionally make the font bold
+)
+grid.newpage()
+grid.draw(venn.plot)
+
+
+# Close the PNG device
+dev.off()
+
+# Create the Venn diagram for the article only markers
+png(filename = "venn_diagram_markers.png", width = 1200, height = 800, res = 100)
+venn.plot <- venn.diagram(
+  x = list(organic = mk_organic, variety = mk_variety, process = mk_procss),
+  category.names = c("Organic", "Variety", "Process"),
+  filename = NULL, # Set to NULL to render the plot in the R graphics device
+  output = TRUE,
+  cex = 2,  # Adjust the text size (increase for larger text)
+    cat.cex = 3 # Optionally make the font bold
+)
+
+# Draw the plot
+grid.newpage()
+grid.draw(venn.plot)
+
+# Close the PNG device
+dev.off()
+```
+### HeathMaps
+```{r}
+# Load the data
+data <- read_excel("output/markers_quantitative.xlsx")
+data <- as.data.frame(data)
+
+
+# Calculate average marker values for each group
+marker_columns <- c("organic", "variety", "procss", "notmarker")  # Update if needed
+averages <- data %>%
+  group_by(target_abc) %>%
+  summarise(across(all_of(marker_columns), mean, na.rm = TRUE))
+
+# Order groups by type (toxic at top, protective below)
+data <- data %>%
+  mutate(target_type = ifelse(grepl("toxic", target_activity, ignore.case = TRUE), "toxic", "protective"))
+
+group_order <- data %>%
+  select(target_abc, target_type) %>%
+  distinct() %>%
+  arrange(desc(target_type))
+
+averages <- averages %>%
+  left_join(group_order, by = "target_abc") %>%
+  arrange(desc(target_type), target_abc)
+
+# Melt the data for heatmap plotting
+melted_averages <- melt(averages, id.vars = c("target_abc", "target_type"), variable.name = "Marker", value.name = "Average")
+
+# Create a heatmap
+heatmap_plot <- ggplot(melted_averages, aes(x = Marker, y = reorder(target_abc, desc(target_type)), fill = Average)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(Average * 100, 1), "%")), size = 3, color = "black") +  # Add average values as percentages inside tiles
+  scale_fill_gradient2(low = "tomato", mid = "white", high = "lightgreen", midpoint = 0, na.value = "grey50") +  # Adjust color scale
+  theme_minimal() +
+  labs(title = "Heatmap of Average Marker Values by Group",
+       x = "Marker",
+       y = "Group") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(target_type), scales = "free_y", space = "free_y")  # Separate toxic and protective groups
+
+# Print the heatmap
+print(heatmap_plot)
+# Save the plot as a PNG file
+ggsave("heatmap_plot.png", plot = heatmap_plot, width = 10, height = 8, dpi = 300)
+
+```
+
+##BoxPlots
+
+```{r}
+# Boxplots
+load("output/AnnComp_stat_MK.RData")
+
+data_distrib_annotated <- mydat_annComp %>%
+  select(c("name", "data2", "target_name")) %>%
+ # filter(noise == FALSE) %>%
+ # filter(!is.na(target_name)) %>% 
+  unnest(data2) %>%
+  select(c("target_name", "id", "norm_indiv_i")) %>%
+  pivot_wider(names_from = "id", values_from = "norm_indiv_i") %>%
+  column_to_rownames("target_name")
+
+df <- as.data.frame(t(data_distrib_annotated)) #transform table
+df$groups<-rownames(df) #we add coume groups in which we write name of the compunds
+df$groups <- gsub('[[:digit:]]+', '', df$groups) #iz stolpca izbrisemo stevilke
+df$groups <- gsub("_", "", df$groups)#iz stolpca izbrisemo _
+#naredimo for loop, iteriramo cez vsak stolpec razen zadnjega kjer imamo group in izrisemo graf
+
+write_xlsx(df, paste0("Norm_intensity_AnnComp.xlsx"))#write excel file with normalized intensity of annotated compounds
+
+#box plots with points
+for(i in seq(ncol(df)-1)){ 
+  y_min <- min(df[[i]], na.rm = TRUE) - 2 
+  y_max <- max(df[[i]], na.rm = TRUE) + 2 # Get min value of column and subtract 1
+  #naredimo for zanko, spremenljivka i bo zavzela vrednost med 1 in st vrstic -1, i je stevilka stolpca
+  print(ggplot(df, aes(x=groups, df[,i])) + 
+          theme(panel.background = element_rect(fill = "white"), plot.title = element_text(hjust = 0.5))+
+          geom_jitter(aes(color=groups), width=0.2, height=0, size=3, show.legend = FALSE)+
+          ylim(c(y_min, y_max)) +
+          #      ylim(c(0, 10)) +
+          xlab("group")+
+          ylab("normalized intensity")+
+          ggtitle(paste(colnames(df[i]), mydat_annComp$target_ion_adduct)))
+}
+#box plots 
+for(i in seq(ncol(df)-1)){ 
+  y_min <- min(df[[i]], na.rm = TRUE) - 2 
+  y_max <- max(df[[i]], na.rm = TRUE) + 2 # Get min value of column and subtract 1
+  #naredimo for zanko, spremenljivka i bo zavzela vrednost med 1 in st vrstic -1, i je stevilka stolpca
+  # Create the boxplot
+  boxplot(df[[i]] ~ df$groups,  # Boxplot by group
+          main = paste("Plot for", colnames(df)[i]),  # Title based on column name
+          ylab = "Normalized Intensity",  # Y-axis label
+          xlab = "Group",  # X-axis label
+          col = "lightblue",  # Box color
+          ylim = c(y_min, y_max)  # Dynamic y-axis limits
+  )
+}
+```
+
+### PDF and word documents
+```{r}
+## Save boxplots as pdf and word documents
+#save as pdf
+pdf("output/boxplot_anncomp.pdf", paper = "a4", height = 4*3, width = 2*4)
+par(mfrow = c(3, 2)) #put three if pdf
+for(i in seq(ncol(df)-1)){ 
+  y_min <- min(df[[i]], na.rm = TRUE) - 2 
+  y_max <- max(df[[i]], na.rm = TRUE) + 2 # Get min value of column and subtract 1
+  #naredimo for zanko, spremenljivka i bo zavzela vrednost med 1 in st vrstic -1, i je stevilka stolpca
+  # Create the boxplot
+  boxplot(df[[i]] ~ df$groups,  # Boxplot by group
+          main = paste("Plot for", colnames(df)[i]),  # Title based on column name
+          ylab = "Normalized Intensity",  # Y-axis label
+          xlab = "Group",  # X-axis label
+          col = "lightblue",  # Box color
+          ylim = c(y_min, y_max)  # Dynamic y-axis limits
+  )
+}
+dev.off() #closing pdf
+
+#save as word document
+# Define the directory where images will be saved
+output_dir <- "output"
+
+# Check if the directory exists, if not, create it
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+# Create a new Word document
+doc <- read_docx()
+
+# Loop through columns (excluding the last one which is for groups)
+for(i in seq(ncol(df) - 1)) {
+  # Calculate dynamic y-axis limits
+  y_min <- min(df[[i]], na.rm = TRUE) - 2
+  y_max <- max(df[[i]], na.rm = TRUE) + 2
+  
+  # Create a ggplot object for the boxplot
+  p <- ggplot(df, aes(x = groups, y = df[[i]])) +
+    geom_boxplot(fill = "lightblue") +
+    labs(title = paste(colnames(df)[i]), 
+         y = "Normalized Intensity", 
+         x = "Group") +
+    ylim(y_min, y_max) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 7),  # Smaller title text size
+      axis.title = element_text(size = 7),  # Smaller axis title text size
+      axis.text = element_text(size = 5),   # Smaller axis labels text size
+      strip.text = element_text(size = 5)   # Smaller strip labels (if any)
+    )
+  
+  # Save the plot to a temporary file (e.g., PNG) in the output directory
+  plot_file <- paste0(output_dir, "/boxplot_", colnames(df)[i], ".png")
+  ggsave(plot_file, plot = p, width = 3, height = 2)
+  
+  # Add the plot image to the Word document
+  doc <- doc %>%
+    body_add_img(src = plot_file, width = 3, height = 2)  # Insert the plot image
+  
+  # Optionally, remove the plot image file after adding it to the Word document
+  file.remove(plot_file)
+}
+
+# Save the Word doc
+print(doc, target = "output/boxplot_anncomp.docx")
+```
+
+
+# Session information
+```{r session}
+Sys.time()-startpoint
+devtools::session_info()
+```
+```{r}
+
+```

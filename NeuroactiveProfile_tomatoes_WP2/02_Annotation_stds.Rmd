@@ -1,0 +1,149 @@
+---
+title: "Annotation"
+author: "Mar Garcia-Aloy"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+https://jorainer.github.io/MetaboAnnotationTutorials/
+
+```{r, include = FALSE}
+startpoint <- Sys.time()
+```
+
+
+# Libraries
+
+```{r libraries}
+p <- "POS"
+software <- "progenesis" #progenesis / mzmine
+myfile <- "data/ANA_MSE_POS_ALL_MASS_PROG.xlsx" #"data/ANA_MSE_POS_ALL_MZMINE.xlsx" #"data/ANA_MSE_POS_ALL_MASS_PROG.xlsx" #ANA_MSE_NEG_ALL_MASS_PROG.xlsx #ANA_MSE_NEG_ALL_MZMINE.xlsx
+
+library(readxl)
+library(MetaboAnnotation)
+library(ggplot2)
+library(RColorBrewer)
+```
+
+
+# Data import
+
+```{r import}
+if(software == "progenesis"){
+  feat <- read_xlsx(myfile, skip = 2) #SKIP first two empty rows 
+
+  tmp <- read_xlsx(myfile)
+  
+  # select normalized data:
+  data <- feat[, grep("Normalised", colnames(tmp)):(grep("Raw", colnames(tmp))-1)]
+
+  feat <- data.frame(feat[,c(3, 5)])
+  colnames(feat) <- c("mz", "RT")
+} else if(software == "mzmine"){
+  feat <- read_xlsx(myfile) 
+  
+  data <- feat[,4:ncol(feat)]
+  feat <- data.frame(feat[,c(2, 3)])
+  colnames(feat) <- c("mz", "RT")
+}
+
+
+feat$FT <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+rownames(data) <- paste0(
+  "FT", formatC(seq(nrow(feat)), width = nchar(nrow(feat)), flag = "0"))
+
+
+load("rdata/ionsdb_stds.RData")
+if(p == "POS"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M+H]+",]
+} else if(p == "NEG"){
+  ionsdb <- ionsdb[ionsdb$ion_adduct == "[M-H]-",]
+}
+```
+
+
+# Compound annotation based on m/z and RT
+
+```{r annotation}
+pr <- MzRtParam(tolerance = 0.01, toleranceRt = 0.15) # define the parameters
+mt_ft <- matchValues(feat, ionsdb, param = pr, 
+                     rtColname = c("RT", "ion_rt"),
+                     mzColname = c("mz", "ion_mz"))
+mtft_df <- data.frame(matchedData(mt_ft))
+mtft_df <- mtft_df[!is.na(mtft_df$target_name),]
+```
+
+
+# Annotated compounds
+
+```{r annotations}
+mtft_df$mz <- round(mtft_df$mz, 4) #less decimals
+mtft_df$RT <- round(mtft_df$RT, 2)
+DT::datatable(mtft_df)
+```
+
+
+# Some plots of annotated compounds
+
+```{r plots}
+tmp <- rownames(data)[which(rownames(data) %in% mtft_df$FT)]
+data <- data[rownames(data) %in% mtft_df$FT, ]
+rownames(data) <- tmp
+rm(tmp)
+
+data_t <- data.frame(t(data))
+md <- data.frame(
+  id = rownames(data_t),
+  order = substr(rownames(data_t), 13, 14), #take the character number 13, 14 of the file name
+  class = substr(rownames(data_t), 16, 100) #take the character from 16 to the end
+)
+md$class <- gsub("_.*", "", md$class) # replace everytging that is after the simbol by nothing
+md$class[grepl("D", md$class) & !grepl("O", md$class)] <- "D"
+md$class[grepl("DO", md$class)] <- "DO"
+md$class[md$class == "PFP"] <- "PF"
+md$class[md$class == "PSP"] <- "PS"
+md$class <- factor(md$class, levels = c("PPB", "QC", "D", "DO", "PF", "PS", "Blank"))
+
+
+col_class <- brewer.pal(8, "Set1")[-6]
+names(col_class) <- c("D", #red
+                      "QC", # blue
+                      "DO", # green
+                      "PF", #purple
+                      "PS", # orange
+                      "PPB", # brown
+                      "Blank" # pink
+)
+
+
+
+set.seed(1234)
+rnd <- runif(nrow(md), -0.2, 0.2)
+
+par(mfrow = c(1, 2))
+for(i in seq(ncol(data_t))){
+  idx <- which(mtft_df$FT == colnames(data_t)[i])
+  plot(as.numeric(md$class) + rnd, data_t[,i], bty = "l",
+       xlab = "class", ylab = "intensity", xaxt = "n", 
+       col = col_class[as.character(md$class)], pch = 16, 
+       main =  paste(mtft_df$target_name[idx],
+                     "\n", round(mtft_df$mz[idx], 4), "@", round(mtft_df$RT[idx], 2)
+       )
+  )
+  axis(1, at = seq(nlevels(md$class)),
+       labels = levels(md$class))
+}
+```
+
+
+# Session info
+
+```{r session-info}
+Sys.time()-startpoint
+devtools::session_info()
+```
+

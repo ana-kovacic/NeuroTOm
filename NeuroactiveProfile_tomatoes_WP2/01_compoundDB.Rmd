@@ -29,15 +29,15 @@ library(CompoundDb)
 # Data import
 
 ```{r import}
-if(file.exists(paste0("rdata/CompDb_tomato_", db, ".sqlite"))){
-  file.remove(paste0("rdata/CompDb_tomato_", db, ".sqlite"))
+if(file.exists(paste0("rdata/CompDb_", db, ".sqlite"))){
+  file.remove(paste0("rdata/CompDb_", db, ".sqlite"))
 }
 if(db == "stds"){
   cmps <- read_xlsx("data/standards.xlsx")
 } else if (db == "SL"){
   cmps <- read.csv("data/SuspectList_3rd_200223.csv")
 } else if (db == "AnnComp"){
-  cmps <- read_xlsx("data/AnnotatedCompounds_AnnComp.xlsx")
+  cmps <- read_xlsx("data/AnnotatedComp_FINAL_ionDB.xlsx")
 } else if(db == "MS2_ann"){
   cmps <- read_xlsx("data/AnnotatedCompounds_SL.xlsx")
 }
@@ -96,7 +96,7 @@ With this information we can already create the `CompDb` database.
 
 ```{r dbfile}
 db_file <- createCompDb(cmps, metadata = metad, path = "rdata/", 
-                        dbFile = paste0("CompDb_tomato_", db, ".sqlite"))
+                        dbFile = paste0("CompDb_", db, ".sqlite"))
 ```
 
 Below we load this database using the `CompDb` function in read-write mode 
